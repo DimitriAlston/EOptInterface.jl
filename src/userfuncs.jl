@@ -71,11 +71,11 @@ function register_odesystem(model::Model, odesys::ODESystem, tspan::Tuple{Number
 end
 
 # full_solutions(sys::ODESystem) <<<
-function full_solutions(sys::ODESystem)
+function full_solutions(sys::ODESystem, soln)
     vars = [unknowns(sys); setdiff(ModelingToolkit.parameters(sys),keys(ModelingToolkit.defaults(sys)))]
     sub_dict = ModelingToolkit.defaults(sys)
     for i in eachindex(vars)
-        sub_dict[vars[i]] = JuMP.value.(x[i])
+        sub_dict[vars[i]] = soln[i]
     end
     for eqn in observed(sys)
         sub_dict[eqn.lhs] = eqn.rhs
