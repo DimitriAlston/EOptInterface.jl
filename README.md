@@ -176,7 +176,7 @@ xU = [100, 1, 1, 1, 100, 10]
 @variable(model, xL[i] <= x[i=1:6] <= xU[i])
 register_nlsystem(model, s, obj, [g1, g2])
 JuMP.optimize!(model)
-full_solutions(s)
+full_solutions(model, s)
 ```
 
 ## References
