@@ -4,27 +4,6 @@ function decision_vars(sys::ODESystem)
     return x
 end
 
-# full_solutions(sys::ODESystem) <<<
-function full_solutions(sys::ODESystem)
-    vars = [unknowns(sys); setdiff(ModelingToolkit.parameters(sys),keys(ModelingToolkit.defaults(sys)))]
-    sub_dict = ModelingToolkit.defaults(sys)
-    for i in eachindex(vars)
-        sub_dict[vars[i]] = JuMP.value.(x[i])
-    end
-    for eqn in observed(sys)
-        sub_dict[eqn.lhs] = eqn.rhs
-    end
-    soln_dict = Dict()
-    for i in eachindex(observed(sys))
-        rhsExpr = observed(s)[i].rhs
-        while ~isempty(intersect(get_variables(rhsExpr),keys(sub_dict)))
-            rhsExpr = substitute(rhsExpr, sub_dict)
-        end
-        soln_dict[observed(s)[i].lhs] = rhsExpr
-    end
-    return soln_dict
-end
-
 # MTK: NLSystem -> JuMP <<<
 function register_nlsystem(model::Model, sys::ODESystem, obj::Num, ineqs::Vector{Num})
     h = mtkns_modeleqs(sys)
@@ -89,4 +68,25 @@ function register_odesystem(model::Model, odesys::ODESystem, tspan::Tuple{Number
             end
         end
     end
+end
+
+# full_solutions(sys::ODESystem) <<<
+function full_solutions(sys::ODESystem)
+    vars = [unknowns(sys); setdiff(ModelingToolkit.parameters(sys),keys(ModelingToolkit.defaults(sys)))]
+    sub_dict = ModelingToolkit.defaults(sys)
+    for i in eachindex(vars)
+        sub_dict[vars[i]] = JuMP.value.(x[i])
+    end
+    for eqn in observed(sys)
+        sub_dict[eqn.lhs] = eqn.rhs
+    end
+    soln_dict = Dict()
+    for i in eachindex(observed(sys))
+        rhsExpr = observed(s)[i].rhs
+        while ~isempty(intersect(get_variables(rhsExpr),keys(sub_dict)))
+            rhsExpr = substitute(rhsExpr, sub_dict)
+        end
+        soln_dict[observed(s)[i].lhs] = rhsExpr
+    end
+    return soln_dict
 end

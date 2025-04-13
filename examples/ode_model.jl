@@ -1,4 +1,4 @@
-using ModelingToolkit, JuMP, EAGO, EOptInterface
+using ModelingToolkit, JuMP, EOptInterface
 using ModelingToolkit: t_nounits as t, D_nounits as D
 
 @mtkmodel KineticParameterEstimation begin
@@ -40,8 +40,9 @@ using CSV, DataFrames
 data = CSV.read("kinetic_intensity_data.csv", DataFrame)
 intensity(x_A,x_B,x_D) = x_A + 2/21*x_B + 2/21*x_D
 
+import Ipopt
+model = Model(Ipopt.Optimizer)
 decision_vars(o)
-model = Model(EAGO.Optimizer)
 pL = [0.001, 10, 10]
 pU = [40, 1200, 1200]
 @variable(model, pL[i] <= p[i=1:3] <= pU[i])

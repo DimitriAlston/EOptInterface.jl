@@ -1,4 +1,4 @@
-using ModelingToolkit, JuMP, EAGO, EOptInterface
+using ModelingToolkit, JuMP, EOptInterface
 using ModelingToolkit: t_nounits as t, D_nounits as D
 
 @connector Stream begin
@@ -133,7 +133,8 @@ g1 = 25 - exprF5
 g2 = 475/3600 - exprTau
 obj = f_CSTR + f_Sep
 
-model = Model(EAGO.Optimizer)
+import Ipopt
+model = Model(Ipopt.Optimizer)
 decision_vars(s)
 xL = zeros(6)
 xU = [100, 1, 1, 1, 100, 10]
