@@ -13,7 +13,6 @@ function register_nlsystem(model::Model, sys::ODESystem, obj::Num, ineqs::Vector
         gi = mtkns_usereqs(ineqs[i], sys)
         push!(g, gi)
     end
-    
     @constraint(model, [i in eachindex(h)], h[i](JuMP.all_variables(model)...) == 0)
     @constraint(model, [i in eachindex(g)], g[i](JuMP.all_variables(model)...) ≤ 0)
     @objective(model, Min, f(JuMP.all_variables(model)...))

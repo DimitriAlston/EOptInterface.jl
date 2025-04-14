@@ -39,8 +39,8 @@ tstep = 0.01
 include("kinetic_intensity_data.jl")
 intensity(x_A,x_B,x_D) = x_A + 2/21*x_B + 2/21*x_D
 
-import Ipopt
-model = Model(Ipopt.Optimizer)
+using EAGO
+model = Model(EAGO.Optimizer)
 decision_vars(o)
 pL = [0.001, 10, 10]
 pU = [40, 1200, 1200]

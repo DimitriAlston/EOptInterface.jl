@@ -133,8 +133,8 @@ g1 = 25 - exprF5
 g2 = 475/3600 - exprTau
 obj = f_CSTR + f_Sep
 
-import Ipopt
-model = Model(Ipopt.Optimizer)
+using EAGO
+model = Model(EAGO.Optimizer)
 decision_vars(s)
 xL = zeros(6)
 xU = [100, 1, 1, 1, 100, 10]
