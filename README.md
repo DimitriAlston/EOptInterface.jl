@@ -32,9 +32,9 @@ Registers algebraic JuMP constraints from ModelingToolkit differential equation 
 
 
 ## Example Usage
-Optimizing algebraic `@mtkbuild` models
+Optimizing algebraic `@mtkbuild` models using EAGO solver
 ```julia
-using ModelingToolkit, JuMP, EAGO, EOptInterface
+using ModelingToolkit, JuMP, EOptInterface
 using ModelingToolkit: t_nounits as t, D_nounits as D
 
 @connector Stream begin
@@ -169,6 +169,7 @@ g1 = 25 - exprF5
 g2 = 475/3600 - exprTau
 obj = f_CSTR + f_Sep
 
+using EAGO
 model = Model(EAGO.Optimizer)
 decision_vars(s)
 xL = zeros(6)
@@ -178,9 +179,9 @@ register_nlsystem(model, s, obj, [g1, g2])
 JuMP.optimize!(model)
 full_solutions(model, s)
 ```
-Optimizing ODE `@mtkbuild` models
+Optimizing ODE `@mtkbuild` models using EAGO solver
 ```julia
-using ModelingToolkit, JuMP, EAGO, EOptInterface
+using ModelingToolkit, JuMP, EOptInterface
 using ModelingToolkit: t_nounits as t, D_nounits as D
 
 @mtkmodel KineticParameterEstimation begin
@@ -221,6 +222,7 @@ tstep = 0.01
 include("kinetic_intensity_data.jl") # see \examples\kinetic_intensity_data.jl
 intensity(x_A,x_B,x_D) = x_A + 2/21*x_B + 2/21*x_D
 
+using EAGO
 model = Model(EAGO.Optimizer)
 decision_vars(o)
 pL = [0.001, 10, 10]
