@@ -1,6 +1,6 @@
 name = "EOptInterface"
 uuid = "96d9f51d-8c41-4e2d-b1a3-7b48dea3ddd1"
-authors = ["Joseph Choi <joseph03choi@gmail.com>", "Matthew Stuber <stuber@uconn.edu>"]
+authors = ["Joseph Choi <jsphchoi@mit.edu>", "Matthew Stuber <matthew.stuber@uconn.edu>"]
 version = "0.1.0-DEV"
 
 [deps]
