@@ -67,7 +67,6 @@ function register_odesystem(model::JuMP.Model, odesys::ModelingToolkit.System, t
             )
         push!(dx, dxj)
     end
-    dx = EOptInterface.mtk_generate_model_equations(odesys)
     # extracting initial conditions from MTK ODESystem -> algebraic JuMP constraint for x[1:V,1]
     ps = JuMP.all_variables(model)[1:length(setdiff(EOptInterface.decision_vars(odesys),ModelingToolkit.unknowns(odesys)))]
     xs = reshape(setdiff(JuMP.all_variables(model),JuMP.all_variables(model)[1:length(setdiff(EOptInterface.decision_vars(odesys),ModelingToolkit.unknowns(odesys)))]), V, N)
