@@ -1,6 +1,7 @@
 using ModelingToolkit, JuMP, EOptInterface
 using ModelingToolkit: t_nounits as t, D_nounits as D
 
+# Formulate MTK ODE System
 @mtkmodel KineticParameterEstimation begin
     @parameters begin
         T = 273
@@ -11,9 +12,9 @@ using ModelingToolkit: t_nounits as t, D_nounits as D
         k_5 = 1.2e-3
         c_O2 = 2e-3
 
-        k_2f
-        k_3f
-        k_4
+        k_2f    # Free design variable
+        k_3f    # Free design variable
+        k_4     # Free design variable
     end
     @variables begin
         x_A(t) = 0.0
@@ -40,20 +41,25 @@ tstep = 0.01
 include("kinetic_intensity_data.jl")
 intensity(x_A,x_B,x_D) = x_A + 2/21*x_B + 2/21*x_D
 
-using EAGO
-model = Model(EAGO.Optimizer)
+# Solve using Ipopt
+using Ipopt
+model = Model(Ipopt.Optimizer)
 decision_vars(o) # Displays: x_Z(t), x_Y(t), x_D(t), x_B(t), x_A(t), k_2f, k_3f, k_4
-# FIRST, create discretized state decision variables
+# FIRST, create discretized differntial state decision variables "z"
 N = Int(floor((tspan[2] - tspan[1])/tstep))+1
 V = length(unknowns(o))
-@variable(model, -75 <= z[1:V,1:N] <= 150.0 ) # ̇z = (x_Z(t), x_Y(t), x_D(t), x_B(t), x_A(t))
-# SECOND, create free design decision variables
-pL = [10, 10, 0.001]
-pU = [1200, 1200, 40]
+zL = zeros(V) # lower bound on z
+zU = [140.0, 0.4, 140.0, 140.0, 140.0] # upper bound on z
+@variable(model, zL[i] <= z[i in 1:V,1:N] <= zU[i]) # ̇z = (x_Z(t), x_Y(t), x_D(t), x_B(t), x_A(t))
+# SECOND, create free design decision variables "p"
+pL = [10, 10, 0.001] # lower bound on p
+pU = [1200, 1200, 40] # upper bound on p
 @variable(model, pL[i] <= p[i=1:3] <= pU[i]) # p = (k_2f, k_3f, k_4)
 register_odesystem(model, o, tspan, tstep, "EE")
 @objective(model, Min, sum((intensity(z[5,i],z[4,i],z[3,i]) - data[i-1])^2 for i in 2:N))
 JuMP.optimize!(model)
+
+# Display results
 println("STATUS: $(JuMP.termination_status(model)), RESULT CODE: $(JuMP.primal_status(model))")
 println("TIME: $(round.(JuMP.solve_time(model),digits=5))")
 println("f^* = $(round(JuMP.objective_value(model),digits=5))")
