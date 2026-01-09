@@ -4,7 +4,7 @@
 
 | **PSOR Lab** | **Documentation**                                                 | **Build Status**                                                                                |
 |:------------:|:-----------------------------------------------------------------:|:-----------------------------------------------------------------------------------------------:|
-| [![](https://img.shields.io/badge/Developed_by-PSOR_Lab-342674)](https://psor.uconn.edu/) | [![Stable](https://img.shields.io/badge/docs-stable-blue.svg)](https://PSORLab.github.io/EOptInterface.jl/stable/) [![Dev](https://img.shields.io/badge/docs-dev-blue.svg)](https://PSORLab.github.io/EOptInterface.jl/dev/) | [![Build Status](https://github.com/PSORLab/EOptInterface.jl/actions/workflows/CI.yml/badge.svg?branch=master)](https://github.com/PSORLab/EOptInterface.jl/actions/workflows/CI.yml?query=branch%3Amaster) |
+| [![](https://img.shields.io/badge/Developed_by-PSOR_Lab-342674)](https://psor.uconn.edu/) | [![Stable](https://img.shields.io/badge/docs-stable-blue.svg)](https://PSORLab.github.io/EOptInterface.jl/stable/) [![Dev](https://img.shields.io/badge/docs-dev-blue.svg)](https://PSORLab.github.io/EOptInterface.jl/dev/) | [![Build Status](https://github.com/PSORLab/EOptInterface.jl/workflows/CI/badge.svg?branch=main)](https://github.com/PSORLab/EOptInterface.jl/actions?query=workflow%3ACI) [![codecov](https://codecov.io/gh/PSORLab/EOptInterface.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/PSORLab/EOptInterface.jl) |
 
 
 
@@ -272,4 +272,5 @@ JuMP.optimize!(model)
 4. A. Wächter, & L. T. Biegler, **On the implementation of an interior-point filter line-search algorithm for large-scale nonlinear programming**, *Mathematical programming*, vol. 106, no. 1, p. 25-57, 2006.
 5. A. C. Kokossis, C. A. Floudas, **Synthesis of isothermal reactor-separator-recycle systems**, *Chemical Engineering Science*, vol. 46, p. 1361-1383, 1991.
 6. J. W. Taylor, **Direct measurement and analysis of cyclohexadienyl oxidation**, Ph.D. thesis, Massachusetts Institute of Technology, 2005.
+
 
