@@ -1,44 +1,53 @@
-
-
 # EOptInterface.jl
 
-EOptInterface.jl is an abstraction layer for automatically formulating JuMP mathematical programming models from ModelingToolkit equation-oriented/acausal models.
+`EOptInterface.jl`, or <ins>**E**</ins>quation-oriented <ins>**Opt**</ins>imization <ins>**Interface**</ins>, is an abstraction layer for automatically formulating mathematical programming `Model`s in `JuMP` directly from componentized equation-oriented models built using `ModelingToolkit`'s high-level `@mtkmodel` interface.
 
-[![Stable](https://img.shields.io/badge/docs-stable-blue.svg)](https://PSORLab.github.io/EOptInterface.jl/stable/)
-[![Dev](https://img.shields.io/badge/docs-dev-blue.svg)](https://PSORLab.github.io/EOptInterface.jl/dev/)
-[![Build Status](https://github.com/PSORLab/EOptInterface.jl/actions/workflows/CI.yml/badge.svg?branch=master)](https://github.com/PSORLab/EOptInterface.jl/actions/workflows/CI.yml?query=branch%3Amaster)
+| **PSOR Lab** | **Documentation**                                                 | **Build Status**                                                                                |
+|:------------:|:-----------------------------------------------------------------:|:-----------------------------------------------------------------------------------------------:|
+| [![](https://img.shields.io/badge/Developed_by-PSOR_Lab-342674)](https://psor.uconn.edu/) | [![Stable](https://img.shields.io/badge/docs-stable-blue.svg)](https://PSORLab.github.io/EOptInterface.jl/stable/) [![Dev](https://img.shields.io/badge/docs-dev-blue.svg)](https://PSORLab.github.io/EOptInterface.jl/dev/) | [![Build Status](https://github.com/PSORLab/EOptInterface.jl/actions/workflows/CI.yml/badge.svg?branch=master)](https://github.com/PSORLab/EOptInterface.jl/actions/workflows/CI.yml?query=branch%3Amaster) |
+
+
 
 ## Feature Summary
 
 ```julia
-decision_vars(::System)
+decision_vars(::ModelingToolkit.System)
 ```
-Displays the optimization problem decision variables.
+Returns the decision variables for an optimization problem formulated from a `ModelingToolkit` system.
 
 ```julia
-register_nlsystem(::Model, ::System, obj::Num, ineqs::Vector{Num})
+register_nlsystem(::JuMP.Model, ::ModelingToolkit.System, obj::Symbolics.Num, ineqs::Vector{Symbolics.Num})
 ```
-Registers algebraic JuMP constraints and objective from ModelingToolkit algebraic `System`s built using `@mtkbuild`.
+Automatically formulates algebraic `JuMP` constraints and objective function from
+an algebraic `ModelingToolkit` system and user-provided constraints and objective symbolic expressions.
 
 ```julia
-full_solutions(::Model, ::System)
+full_solutions(::JuMP.Model, ::ModelingToolkit.System)
 ```
-Returns a dictionary of optimal solution values for all eliminated variables from ModelingToolkit's structural simplification step.
+Returns a dictionary of optimal solution values for the observed variables of an algebraic `ModelingToolkit` system if the `JuMP` model is solved.
 
 ```julia
-register_odesystem(::Model, ::System, tspan::Tuple{Number,Number}, tstep::Number, solver::String)
+register_odesystem(::JuMP.Model, ::ModelingToolkit.System, tspan::Tuple{Number,Number}, tstep::Number, solver::String)
 ```
-Registers algebraic JuMP constraints from ModelingToolkit ODE `System`s built using `@mtkbuild`. Available integration schemes: `"EE", "IE"`
+Automatically applies forward transcription and registers the discretized ODE `ModelingToolkit` system as algebraic `JuMP` constraints. Available integration methods: `"EE"` (explicit Euler), `"IE"` (implicit Euler).
 
 
 
 
-## Example Usage
-Optimizing algebraic `@mtkbuild` models using EAGO solver
+## Example Usage: Algebraic Models
+
+An optimal reactor-separator-recycle process design problem originally presented by [Kokosis and Floudas⁵](https://doi.org/10.1016/0009-2509(91)85063-4) is used to demonstrate the use of `register_nlsystem` to formulate and solve a reduced-space `Model` using the deterministic global optimizer `EAGO`.
+
+<p align="center">
+  <img width="1111" height="579" alt="image" src="https://github.com/user-attachments/assets/310a47fc-504e-4864-9d77-8f8165e4feb0" />
+  Figure 1: Illustration of the reactor-separator-recycle system.
+</p>
+
 ```julia
 using ModelingToolkit, JuMP, EOptInterface
 using ModelingToolkit: t_nounits as t, D_nounits as D
 
+# Formulate MTK algebraic System
 @connector Stream begin
     @variables begin
         F(t),   [input=true]
@@ -57,7 +66,7 @@ end
         out = Stream()
     end
     @parameters begin
-        F
+        F       # Free design variable
         y_A = 1
         y_B = 0
         y_C = 0
@@ -88,7 +97,7 @@ end
         out = Stream()
     end
     @parameters begin
-        V
+        V       # Free design variable
         k_1 = 0.4
         k_2 = 0.055
     end
@@ -160,6 +169,8 @@ end
 
 @mtkcompile s = ReactorSeparatorRecycle()
 
+# Define symbolic expressions of constraints and objective
+# Use syntax System.Component.Connector.Variable, System.Component.Component.Parameter, or System.Component.Parameter
 exprF5 = s.sep2.outV.F
 exprTau = s.cstr.V/(s.cstr.out.F*(s.cstr.out.y_A*s.cstr.in.V_A + s.cstr.out.y_B*s.cstr.in.V_B + s.cstr.out.y_C*s.cstr.in.V_C))
 f_CSTR = (25764 + 8178*s.cstr.V)/2.5
@@ -172,22 +183,30 @@ g1 = 25 - exprF5
 g2 = 475/3600 - exprTau
 obj = f_CSTR + f_Sep
 
+# Solve using EAGO
 using EAGO
 model = Model(EAGO.Optimizer)
-decision_vars(s)
-xL = zeros(6)
-xU = [100, 1, 1, 1, 100, 10]
-@variable(model, xL[i] <= x[i=1:6] <= xU[i])
+decision_vars(s) # Displays: sep1₊in₊F(t), sep1₊in₊y_B(t), sep1₊in₊y_C(t), sep1₊outL₊y_C(t), influent₊F, cstr₊V
+xL = zeros(6) # lower bound on x
+xU = [100, 1, 1, 1, 100, 10] # upper bound on x
+@variable(model, xL[i] <= x[i=1:6] <= xU[i]) # ̂x = (̂z,p), ̂z = (z(t),...), p = (influent₊F, cstr₊V)
 register_nlsystem(model, s, obj, [g1, g2])
 JuMP.optimize!(model)
 JuMP.value.(x)
+
+# Obtain observed variable solutions
 full_solutions(model, s)
 ```
-Optimizing ODE `System`s using EAGO solver
+
+## Example Usage: ODE Models
+
+A nonlinear kinetic parameter estimation problem originally described by [Taylor⁶](http://hdl.handle.net/1721.1/33716) is used to demonstrate the use of `register_odesystem` to formulate a `Model` from an ODE `System`, solved using `Ipopt`.
+
 ```julia
 using ModelingToolkit, JuMP, EOptInterface
 using ModelingToolkit: t_nounits as t, D_nounits as D
 
+# Formulate MTK ODE System
 @mtkmodel KineticParameterEstimation begin
     @parameters begin
         T = 273
@@ -198,9 +217,9 @@ using ModelingToolkit: t_nounits as t, D_nounits as D
         k_5 = 1.2e-3
         c_O2 = 2e-3
 
-        k_2f
-        k_3f
-        k_4
+        k_2f    # Free design variable
+        k_3f    # Free design variable
+        k_4     # Free design variable
     end
     @variables begin
         x_A(t) = 0.0
@@ -227,16 +246,21 @@ tstep = 0.01
 include("kinetic_intensity_data.jl")
 intensity(x_A,x_B,x_D) = x_A + 2/21*x_B + 2/21*x_D
 
-using EAGO
-model = Model(EAGO.Optimizer)
-decision_vars(o)
+# Solve using Ipopt
+using Ipopt
+model = Model(Ipopt.Optimizer)
+decision_vars(o) # Displays: x_Z(t), x_Y(t), x_D(t), x_B(t), x_A(t), k_2f, k_3f, k_4
+# FIRST, create discretized differntial state decision variables "z"
 N = Int(floor((tspan[2] - tspan[1])/tstep))+1
 V = length(unknowns(o))
-@variable(model, -75 <= z[1:V,1:N] <= 150.0 ) # ̇z = (x_Z(t), x_Y(t), x_D(t), x_B(t), x_A(t))
-pL = [10, 10, 0.001]
-pU = [1200, 1200, 40]
+zL = zeros(V) # lower bound on z
+zU = [140.0, 0.4, 140.0, 140.0, 140.0] # upper bound on z
+@variable(model, zL[i] <= z[i in 1:V,1:N] <= zU[i]) # ̇z = (x_Z(t), x_Y(t), x_D(t), x_B(t), x_A(t))
+# SECOND, create free design decision variables "p"
+pL = [10, 10, 0.001] # lower bound on p
+pU = [1200, 1200, 40] # upper bound on p
 @variable(model, pL[i] <= p[i=1:3] <= pU[i]) # p = (k_2f, k_3f, k_4)
-register_odesystem(model, o, tspan, tstep, "EE")
+register_odesystem(model, o, tspan, tstep, "EE") # Try changing between "EE" and "IE"!
 @objective(model, Min, sum((intensity(z[5,i],z[4,i],z[3,i]) - data[i-1])^2 for i in 2:N))
 JuMP.optimize!(model)
 ```
@@ -244,5 +268,8 @@ JuMP.optimize!(model)
 ## References
 1. Y. Ma, S. Gowda, R. Anantharaman, C. Laughman, V. Shah, and C. Rackauckas, **ModelingToolkit: A composable graph transformation system for equation-based modeling**, 2021.
 2. M. Lubin, O. Dowson, J. Dias Garcia, J. Huchette, B. Legat, and J. P. Vielma, **JuMP 1.0: Recent improvements to a modeling language for mathematical optimization**, *Mathematical Programming Computation*, vol. 15, p. 581-589, 2023.
-3. M. Wilhelm and M. Stuber, **EAGO.jl Easy Advanced Global Optimization in Julia**, *Optimization Methods and Software*, vol. 37, no. 2, pp. 425-450, 2022.
+3. M. Wilhelm and M. Stuber, **EAGO.jl Easy Advanced Global Optimization in Julia**, *Optimization Methods and Software*, vol. 37, no. 2, p. 425-450, 2022.
+4. A. Wächter, & L. T. Biegler, **On the implementation of an interior-point filter line-search algorithm for large-scale nonlinear programming**, *Mathematical programming*, vol. 106, no. 1, p. 25-57, 2006.
+5. A. C. Kokossis, C. A. Floudas, **Synthesis of isothermal reactor-separator-recycle systems**, *Chemical Engineering Science*, vol. 46, p. 1361-1383, 1991.
+6. J. W. Taylor, **Direct measurement and analysis of cyclohexadienyl oxidation**, Ph.D. thesis, Massachusetts Institute of Technology, 2005.
 
