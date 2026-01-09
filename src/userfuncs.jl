@@ -1,7 +1,7 @@
 """
     decision_vars(sys)
 
-Displays the decision variables for optimization problem of a ModelingToolkit model.
+Returns the decision variables for an optimization problem formulated from a ModelingToolkit model.
 """
 function decision_vars(sys::ModelingToolkit.System)
     return [
@@ -13,7 +13,8 @@ end
 """
     register_nlsystem(model, sys, obj, ineqs)
 
-Registers a ModelingToolkit algebraic model, objective function, and inequality constraints as algebraic constraints in JuMP.
+Automatically formulates algebraic JuMP constraints and objective function from
+an algebraic ModelingToolkit system and user-provided constraints and objective symbolic expressions.
 
 # Arguments
 - `model::Model`: the JuMP model
@@ -37,14 +38,14 @@ end
 """
     register_odesystem(model, sys, tspan, tstep, integrator)
 
-Registers a ModelingToolkit dynamic model as algebraic constraints in JuMP by discretizing ODEs as a system of algebraic equations.
+Automatically applies forward transcription and registers the discretized ODE ModelingToolkit system as algebraic JuMP constraints.
 
 # Arguments
 - `model::Model`: the JuMP model
 - `sys::System`: the ModelingToolkit model
 - `tspan::Type{Number,Number}`: the time span over which the dynamic model is simulated
 - `tstep::Number`: the time step used in the integration scheme
-- `integrator::String`: integration scheme used in discretization, `"EE"` for Explicit Euler or `"IE"` for Implicit Euler
+- `integrator::String`: integration scheme used in discretization, `"EE"` for explicit Euler or `"IE"` for implicit Euler
 """
 function register_odesystem(model::JuMP.Model, odesys::ModelingToolkit.System, tspan::Tuple{Real,Real}, tstep::Real, integrator::String)
     N = Int(floor((tspan[2] - tspan[1])/tstep))+1 # number of discrete time nodes
@@ -84,7 +85,7 @@ end
 """
     full_solutions(model, sys)
 
-Returns a dictionary of optimal solution values for the observed variables for a ModelingToolkit algebraic model.
+Returns a dictionary of optimal solution values for the observed variables of an algebraic ModelingToolkit system if the JuMP model is solved.
 """
 function full_solutions(model::JuMP.Model, sys::ModelingToolkit.System)
     vars = decision_vars(sys)
