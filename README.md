@@ -1,6 +1,6 @@
 # EOptInterface.jl
 
-`EOptInterface.jl`, or <ins>**E**</ins>quation-oriented <ins>**Opt**</ins>imization <ins>**Interface**</ins>, is an abstraction layer for automatically formulating mathematical programming `Model`s in `JuMP` directly from componentized equation-oriented models built using `ModelingToolkit`'s high-level `@mtkmodel` interface.
+`EOptInterface.jl`, or <ins>**E**</ins>quation-oriented <ins>**Opt**</ins>imization <ins>**Interface**</ins>, is an abstraction layer for automatically formulating mathematical programming `Model`s in `JuMP` directly from componentized equation-oriented `System`s built using `ModelingToolkit`'s high-level `@mtkmodel` interface.
 
 | **PSOR Lab** | **Documentation**                                                 | **Build Status**                                                                                |
 |:------------:|:-----------------------------------------------------------------:|:-----------------------------------------------------------------------------------------------:|
@@ -272,5 +272,6 @@ JuMP.optimize!(model)
 4. A. Wächter, & L. T. Biegler, **On the implementation of an interior-point filter line-search algorithm for large-scale nonlinear programming**, *Mathematical programming*, vol. 106, no. 1, p. 25-57, 2006.
 5. A. C. Kokossis, C. A. Floudas, **Synthesis of isothermal reactor-separator-recycle systems**, *Chemical Engineering Science*, vol. 46, p. 1361-1383, 1991.
 6. J. W. Taylor, **Direct measurement and analysis of cyclohexadienyl oxidation**, Ph.D. thesis, Massachusetts Institute of Technology, 2005.
+
 
 
