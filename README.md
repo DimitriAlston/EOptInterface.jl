@@ -39,7 +39,7 @@ Automatically applies forward transcription and registers the discretized ODE `M
 An optimal reactor-separator-recycle process design problem originally presented by [Kokosis and Floudas⁵](https://doi.org/10.1016/0009-2509(91)85063-4) is used to demonstrate the use of `register_nlsystem` to formulate and solve a reduced-space `Model` using the deterministic global optimizer `EAGO`.
 
 <p align="center">
-  <img width="1111" height="579" alt="image" src="https://github.com/user-attachments/assets/310a47fc-504e-4864-9d77-8f8165e4feb0" />
+  <img width="2226" height="1160" alt="image" src="https://github.com/user-attachments/assets/e81ae866-dcff-4d18-8a5b-c5e37957187c" />
   Figure 1: Illustration of the reactor-separator-recycle system.
 </p>
 
@@ -272,6 +272,7 @@ JuMP.optimize!(model)
 4. A. Wächter, & L. T. Biegler, **On the implementation of an interior-point filter line-search algorithm for large-scale nonlinear programming**, *Mathematical programming*, vol. 106, no. 1, p. 25-57, 2006.
 5. A. C. Kokossis, C. A. Floudas, **Synthesis of isothermal reactor-separator-recycle systems**, *Chemical Engineering Science*, vol. 46, p. 1361-1383, 1991.
 6. J. W. Taylor, **Direct measurement and analysis of cyclohexadienyl oxidation**, Ph.D. thesis, Massachusetts Institute of Technology, 2005.
+
 
 
 
