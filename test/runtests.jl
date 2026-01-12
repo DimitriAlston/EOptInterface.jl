@@ -299,7 +299,7 @@ using ModelingToolkit: t_nounits as t, D_nounits as D
     zL = zeros(V)
     zU = [140.0, 0.4, 140.0, 140.0, 140.0]
     @variable(model, zL[i] <= z[i in 1:V,1:N] <= zU[i])
-    pL = [10, 10, 0.001
+    pL = [10, 10, 0.001]
     pU = [1200, 1200, 40]
     @variable(model, pL[i] <= p[i=1:3] <= pU[i])
     register_odesystem(model, o, tspan, tstep, "EE")
