@@ -2,10 +2,10 @@ name: CI
 on:
   pull_request:
     branches:
-      - master
+      - main
   push:
     branches:
-      - master
+      - main
     tags: '*'
 # needed to allow julia-actions/cache to delete old caches that it has created
 permissions:
@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ['1.10', '1.11']
+        version: ['1.11']
         os: [ubuntu-latest, windows-latest]
         arch: [x64]
     steps:
