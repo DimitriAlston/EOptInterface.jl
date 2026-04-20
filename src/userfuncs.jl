@@ -317,7 +317,13 @@ function register_odesystem(model::JuMP.Model,
     end
 
     t_MTK = ModelingToolkit.get_iv(odesys)
-    t_at(i::Int; c::Real=0.0) = t_map[t_MTK] + (i-1 + c) * tstep
+    # Preserve the legacy no-keyword use case: if no JuMP time variable is
+    # passed in, evaluate the MTK RHS at numeric times on the discretization grid.
+    t_base = haskey(t_map, t_MTK) ? t_map[t_MTK] : tspan[1]
+    t_at(i::Int; c::Real=0.0) = t_base + (i-1 + c) * tstep
+
+    params_to_opt = setdiff(decision_vars(odesys, p_disc), ModelingToolkit.unknowns(odesys))
+    static_param_syms = setdiff(params_to_opt, p_disc)
 
     dx = Vector{Function}(undef, V)
     dx_exprs = Vector{Symbolics.Num}(undef, V)
@@ -351,47 +357,87 @@ function register_odesystem(model::JuMP.Model,
     # 3) Build the state matrix `xs`.
     unknowns = ModelingToolkit.unknowns(odesys)
     xs = Array{JuMP.VariableRef}(undef, V, N)
+    static_param_vars = JuMP.VariableRef[]
     if !isempty(x_vars)
         for (j, u) in enumerate(unknowns)
             @assert haskey(x_vars, u) "Missing x_vars[$u]"
             @assert length(x_vars[u]) == N "x_vars[$u] must have length N=$N"
             xs[j, :] = x_vars[u]
         end
+        if !isempty(static_param_syms)
+            state_var_refs = vec(xs)
+            extra_vars = setdiff(JuMP.all_variables(model), vcat(state_var_refs, flat_pvars))
+            @assert length(extra_vars) >= length(static_param_syms) "register_odesystem could not infer static parameter variables from the model. Pass p_disc_vars=... or build the static parameter variables explicitly before calling register_odesystem."
+            static_param_vars = extra_vars[1:length(static_param_syms)]
+        end
     else
         # Old fallback path. Passing `x_vars` is safer.
-        xs = reshape(setdiff(JuMP.all_variables(model), flat_pvars), V, N)
+        # Preserve the original examples that:
+        # 1. add the state trajectories first, and
+        # 2. append free design parameters afterwards.
+        all_vars = JuMP.all_variables(model)
+        state_var_count = V * N
+        fallback_vars = setdiff(all_vars, flat_pvars)
+        if length(fallback_vars) == state_var_count
+            xs = reshape(fallback_vars, V, N)
+        else
+            legacy_param_count = length(setdiff(decision_vars(odesys), unknowns))
+            if length(all_vars) >= state_var_count + legacy_param_count
+                xs = reshape(all_vars[1:state_var_count], V, N)
+                if !isempty(static_param_syms)
+                    @assert length(all_vars) >= state_var_count + length(static_param_syms) "register_odesystem legacy fallback could not infer static parameter variables."
+                    static_param_vars = all_vars[(state_var_count + 1):(state_var_count + length(static_param_syms))]
+                end
+            else
+                error("register_odesystem fallback could not infer a $(V)x$(N) state matrix from $(length(all_vars)) JuMP variables. Pass x_vars=... explicitly.")
+            end
+        end
+        if isempty(static_param_vars) && !isempty(static_param_syms)
+            extra_vars = setdiff(all_vars, vcat(vec(xs), flat_pvars))
+            @assert length(extra_vars) >= length(static_param_syms) "register_odesystem legacy fallback could not infer static parameter variables."
+            static_param_vars = extra_vars[1:length(static_param_syms)]
+        end
         @warn "register_odesystem: inferring state ordering from all_variables; pass x_vars=... to avoid mismatches."
+        # Preserve the legacy API path used by the older examples: if the caller
+        # did not pass explicit state trajectories, also create/repair the
+        # initial-condition equalities from MTK defaults.
+        defaults = ModelingToolkit.defaults(odesys)
+        for (j, u) in enumerate(unknowns)
+            haskey(defaults, u) || continue
+            get_ic_constraint!(model, xs[j, :]; idx=1, rhs_if_missing=float(defaults[u]))
+        end
     end
 
 
     # 4) Add the ODE step constraints.
     for i in 1:(N-1)
         p_args_i   = [p_disc_vars[p][i] for p in p_disc]
+        all_p_args_i = vcat(p_args_i, static_param_vars)
 
         if intg == "EE"
             for j in 1:V
                 # Explicit Euler uses the current slope.
-                JuMP.@constraint(model, xs[j, i+1] == xs[j, i] + tstep * dx[j](xs[:, i]..., p_args_i..., t_at(i)))
+                JuMP.@constraint(model, xs[j, i+1] == xs[j, i] + tstep * dx[j](xs[:, i]..., all_p_args_i..., t_at(i)))
             end
 
         elseif intg == "IE"
             for j in 1:V
                 # Implicit Euler uses the next slope.
-                JuMP.@constraint(model, xs[j, i+1] == xs[j, i] + tstep * dx[j](xs[:, i+1]..., p_args_i..., t_at(i, c=1.0)))
+                JuMP.@constraint(model, xs[j, i+1] == xs[j, i] + tstep * dx[j](xs[:, i+1]..., all_p_args_i..., t_at(i, c=1.0)))
             end
 
         elseif intg == "RK4"
             # RK4 uses four slope estimates.
-            k1 = [dx[j](xs[:, i]..., p_args_i..., t_at(i)) for j in 1:V]
+            k1 = [dx[j](xs[:, i]..., all_p_args_i..., t_at(i)) for j in 1:V]
             xk1_half = [xs[j, i] + 0.5 * tstep * k1[j] for j in 1:V]
 
-            k2 = [dx[j](xk1_half..., p_args_i..., t_at(i, c=0.5)) for j in 1:V]
+            k2 = [dx[j](xk1_half..., all_p_args_i..., t_at(i, c=0.5)) for j in 1:V]
             xk2_half = [xs[j, i] + 0.5 * tstep * k2[j] for j in 1:V]
 
-            k3 = [dx[j](xk2_half..., p_args_i..., t_at(i, c=0.5)) for j in 1:V]
+            k3 = [dx[j](xk2_half..., all_p_args_i..., t_at(i, c=0.5)) for j in 1:V]
             xk3_full = [xs[j, i] + tstep * k3[j] for j in 1:V]
 
-            k4 = [dx[j](xk3_full..., p_args_i..., t_at(i, c=1.0)) for j in 1:V]
+            k4 = [dx[j](xk3_full..., all_p_args_i..., t_at(i, c=1.0)) for j in 1:V]
 
             for j in 1:V
                 JuMP.@constraint(model, xs[j, i+1] == xs[j, i] + (tstep/6) * (k1[j] + 2*k2[j] + 2*k3[j] + k4[j]))
@@ -413,12 +459,12 @@ function register_odesystem(model::JuMP.Model,
 
             y1 = [xs[j, i] + tstep*(a11*ks[j,1] + a12*ks[j,2]) for j in 1:V]
             for j in 1:V
-                JuMP.@constraint(model, ks[j,1] == dx[j](y1..., p_args_i..., t_at(i, c=c1)))
+                JuMP.@constraint(model, ks[j,1] == dx[j](y1..., all_p_args_i..., t_at(i, c=c1)))
             end
 
             y2 = [xs[j, i] + tstep*(a21*ks[j,1] + a22*ks[j,2]) for j in 1:V]
             for j in 1:V
-                JuMP.@constraint(model, ks[j,2] == dx[j](y2..., p_args_i..., t_at(i, c=c2)))
+                JuMP.@constraint(model, ks[j,2] == dx[j](y2..., all_p_args_i..., t_at(i, c=c2)))
             end
 
             for j in 1:V

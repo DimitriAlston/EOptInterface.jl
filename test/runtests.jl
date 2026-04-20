@@ -238,16 +238,19 @@ end
             config = cfg,
         )
 
+        u_key = only(collect(keys(ctrl.control_vars)))
+        d_key = only(collect(keys(ctrl.stage_param_vars)))
+
         @test ctrl.N == 4
         @test ctrl.Nc == 2
-        @test length(ctrl.control_vars[sys.u]) == 4
-        @test JuMP.fix_value(ctrl.stage_param_vars[sys.d][2]) == 1.1
+        @test length(ctrl.control_vars[u_key]) == 4
+        @test JuMP.fix_value(ctrl.stage_param_vars[d_key][2]) == 1.1
         @test JuMP.fix_value(ctrl.target_vars[x_sym]) == 1.2
         @test haskey(model.ext, :tracking_mpc)
         @test model.ext[:tracking_mpc] === ctrl
 
-        update_stage_parameter!(ctrl, sys.d, 2.0)
-        @test all(JuMP.fix_value(v) == 2.0 for v in ctrl.stage_param_vars[sys.d])
+        update_stage_parameter!(ctrl, d_key, 2.0)
+        @test all(JuMP.fix_value(v) == 2.0 for v in ctrl.stage_param_vars[d_key])
 
         update_tracking_targets!(
             ctrl;
@@ -259,21 +262,118 @@ end
         @test JuMP.fix_value(ctrl.lower_ref_vars[x_sym]) == 1.0
         @test JuMP.fix_value(ctrl.upper_ref_vars[x_sym]) == 1.8
 
-        prepare_tracking_mpc_step!(ctrl, Dict(x_sym => 0.25), Dict(sys.u => 0.9))
+        prepare_tracking_mpc_step!(ctrl, Dict(x_sym => 0.25), Dict(u_key => 0.9))
         @test JuMP.normalized_rhs(ctrl.c_ic[x_sym]) == 0.25
-        @test JuMP.normalized_rhs(ctrl.first_move_anchors[sys.u]) == 0.9
-        @test JuMP.lower_bound(ctrl.control_vars[sys.u][1]) == 0.5
-        @test JuMP.upper_bound(ctrl.control_vars[sys.u][1]) == 1.3
-        @test JuMP.start_value(ctrl.control_vars[sys.u][1]) == 0.9
+        @test JuMP.normalized_rhs(ctrl.first_move_anchors[u_key]) == 0.9
+        @test JuMP.lower_bound(ctrl.control_vars[u_key][1]) == 0.5
+        @test JuMP.upper_bound(ctrl.control_vars[u_key][1]) == 1.3
+        @test JuMP.start_value(ctrl.control_vars[u_key][1]) == 0.9
 
-        integ = FakeIntegrator(0.0, [0.33], Dict(sys.u => 0.9))
+        integ = FakeIntegrator(0.0, [0.33], Dict(u_key => 0.9))
         cmap = current_state_map(integ, sys)
         @test cmap[x_sym] == 0.33
 
-        logctx = make_mpc_log([x_sym]; control_keys=[sys.u], predicted_keys=[x_sym], metric_keys=[:objective])
-        seed_mpc_log!(logctx, Dict(x_sym => 0.33), 0.0; control_values=Dict(sys.u => 0.9))
+        logctx = make_mpc_log([x_sym]; control_keys=[u_key], predicted_keys=[x_sym], metric_keys=[:objective])
+        seed_mpc_log!(logctx, Dict(x_sym => 0.33), 0.0; control_values=Dict(u_key => 0.9))
         @test logctx.ts == [0.0]
         @test logctx.Xhist[x_sym] == [0.33]
-        @test logctx.Controlhist[sys.u] == [0.9]
+        @test logctx.Controlhist[u_key] == [0.9]
+    end
+
+    @testset "legacy registration compatibility" begin
+        @testset "legacy ode_model no-keyword registration" begin
+            @mtkmodel KineticParameterEstimation begin
+                @parameters begin
+                    T = 273
+                    K_2 = 46 * exp(6500 / T - 18)
+                    K_3 = 2 * K_2
+                    k_1 = 53
+                    k_1s = k_1 * 1e-6
+                    k_5 = 1.2e-3
+                    c_O2 = 2e-3
+                    k_2f
+                    k_3f
+                    k_4
+                end
+                @variables begin
+                    x_A(t) = 0.0
+                    x_B(t) = 0.0
+                    x_D(t) = 0.0
+                    x_Y(t) = 0.4
+                    x_Z(t) = 140.0
+                    I(t)
+                end
+                @equations begin
+                    D(x_A) ~ k_1 * x_Z * x_Y - c_O2 * (k_2f + k_3f) * x_A + k_2f / K_2 * x_D + k_3f / K_3 * x_B - k_5 * x_A^2
+                    D(x_B) ~ c_O2 * k_3f * x_A - (k_3f / K_3 + k_4) * x_B
+                    D(x_D) ~ c_O2 * k_2f * x_A - k_2f / K_2 * x_D
+                    D(x_Y) ~ -k_1s * x_Z * x_Y
+                    D(x_Z) ~ -k_1 * x_Z * x_Y
+                    I ~ x_A + 2 / 21 * x_B + 2 / 21 * x_D
+                end
+            end
+
+            @mtkcompile o = KineticParameterEstimation()
+            tspan = (0.0, 0.1)
+            tstep = 0.01
+            N = Int(floor((tspan[2] - tspan[1]) / tstep)) + 1
+            V = length(unknowns(o))
+
+            model = Model()
+            @variable(model, -75 <= z[1:V, 1:N] <= 150.0)
+            pL = [10.0, 10.0, 0.001]
+            pU = [1200.0, 1200.0, 40.0]
+            @variable(model, pL[i] <= p[i = 1:3] <= pU[i])
+
+            register_odesystem(model, o, tspan, tstep, "EE")
+
+            @test JuMP.num_variables(model) == V * N + 3
+            @test JuMP.num_constraints(model; count_variable_in_set_constraints = false) > 0
+        end
+
+        @testset "low-level dae registration" begin
+            @parameters u = 0.0
+            ModelingToolkit.@variables x_dae(t) = 0.0 z_dae(t) = 0.0
+            @named dae_keep = System([
+                D(x_dae) ~ -x_dae + z_dae + u,
+                0 ~ z_dae + sin(z_dae) - x_dae,
+            ], t)
+
+            model = Model()
+            dt_dae = 0.2
+            tspan_dae = (0.0, 0.4)
+            horizon = Int(floor((tspan_dae[2] - tspan_dae[1]) / dt_dae)) + 1
+            ctx = decision_vars(dae_keep, Num[]; model = model, horizon = horizon, build_state_trajs = true, lb = -4.0, ub = 4.0)
+
+            x_key = only(filter(sym -> endswith(string(sym), "x_dae(t)"), collect(keys(ctx.x_vars))))
+            z_key = only(filter(sym -> endswith(string(sym), "z_dae(t)"), collect(keys(ctx.x_vars))))
+            u_key = Num(only(filter(sym -> endswith(string(sym), "u"), collect(ModelingToolkit.parameters(dae_keep)))))
+
+            x_traj = ctx.x_vars[x_key]
+            z_traj = ctx.x_vars[z_key]
+            @variable(model, -2.0 <= u_traj[1:horizon] <= 2.0)
+
+            for var in x_traj
+                JuMP.set_start_value(var, 0.0)
+            end
+            for var in z_traj
+                JuMP.set_start_value(var, 0.0)
+            end
+
+            register_daesystem(
+                model,
+                dae_keep,
+                tspan_dae,
+                dt_dae,
+                "IE";
+                p_disc = [u_key],
+                p_disc_vars = Dict(u_key => u_traj),
+                x_vars = ctx.x_vars,
+            )
+
+            @test JuMP.num_constraints(model; count_variable_in_set_constraints = false) > 0
+            @test length(x_traj) == horizon
+            @test length(z_traj) == horizon
+        end
     end
 end
