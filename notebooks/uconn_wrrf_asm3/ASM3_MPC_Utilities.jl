@@ -7,6 +7,14 @@ using Ipopt
 using DataFrames
 using Printf
 
+"""
+    MPCConfig
+
+Configuration bundle for the UConn ASM3 MPC example.
+
+This struct keeps the public notebook settings in one place: horizons,
+tracking weights, actuator limits, and live status-printing behavior.
+"""
 Base.@kwdef struct MPCConfig
     PH::Int = 20
     CH::Int = 10
@@ -33,6 +41,15 @@ Base.@kwdef struct MPCConfig
     verbose::Bool = false
 end
 
+"""
+    MPCController
+
+Container for the reusable ASM3 MPC problem.
+
+It stores the built JuMP model, references to the state and control
+trajectories, the objective terms used for logging, and the most recent solved
+trajectory used for warm starts.
+"""
 mutable struct MPCController
     cfg::MPCConfig
     sys
@@ -57,6 +74,14 @@ mutable struct MPCController
     last_state_trajs::Union{Nothing, Dict{Num, Vector{Float64}}}
 end
 
+"""
+    UConnMPCLog
+
+Simple log container for the closed-loop ASM3 notebook.
+
+Each vector records one quantity over time so the notebook can build plots and
+tables after the simulation finishes.
+"""
 Base.@kwdef mutable struct UConnMPCLog
     i_state::AbstractDict
     ts::Vector{Float64} = Float64[]
@@ -74,6 +99,14 @@ Base.@kwdef mutable struct UConnMPCLog
     energy_terms::Vector{Float64} = Float64[]
 end
 
+"""
+    _rhs_from_override(override, x, rhs0)
+
+Read the initial value to use for symbolic variable `x`.
+
+The helper accepts both direct symbolic keys and string-equivalent keys. This
+is useful when state dictionaries come from slightly different MTK code paths.
+"""
 function _rhs_from_override(override, x, rhs0)
     if haskey(override, x)
         return float(override[x])
@@ -87,6 +120,14 @@ function _rhs_from_override(override, x, rhs0)
     return rhs0
 end
 
+"""
+    _mk_ic!(model, v, x; override=Dict(), rhs0=0.0)
+
+Create or recover the initial-condition constraint for trajectory `v`.
+
+This small wrapper keeps the controller builder readable by hiding the
+"find the right initial value, then ensure the IC constraint exists" logic.
+"""
 function _mk_ic!(
     model::JuMP.Model,
     v::Vector{JuMP.VariableRef},
@@ -98,6 +139,14 @@ function _mk_ic!(
     return get_ic_constraint!(model, v; idx = 1, rhs_if_missing = rhs)
 end
 
+"""
+    _fmt_uconn_scalar(x; digits=3)
+
+Format one scalar for live MPC status printing.
+
+Finite numeric values are printed with a fixed number of digits. Everything
+else falls back to `"NaN"` so the log output remains readable.
+"""
 function _fmt_uconn_scalar(x; digits::Int = 3)
     if x isa Real && isfinite(float(x))
         return @sprintf("%.*f", digits, float(x))
@@ -105,6 +154,14 @@ function _fmt_uconn_scalar(x; digits::Int = 3)
     return "NaN"
 end
 
+"""
+    _uconn_status_io(cfg)
+
+Return the output stream used by live MPC status printing.
+
+The notebook lets users choose `:stdout` or `:stderr` so the status lines can
+either live in the normal cell output or in the error stream.
+"""
 function _uconn_status_io(cfg::MPCConfig)
     if cfg.status_stream === :stdout
         return stdout
@@ -114,6 +171,15 @@ function _uconn_status_io(cfg::MPCConfig)
     error("Unsupported UConn MPC status stream $(cfg.status_stream). Use :stdout or :stderr.")
 end
 
+"""
+    print_uconn_mpc_status(io, ctrl, status, objective, tnow, y_now, setpoint, KLa2_now, KLa4_now; ...)
+
+Print one human-readable summary line after an MPC trigger.
+
+This is the notebook-facing status logger. It is intentionally compact so users
+can watch the controller solve step by step while the closed-loop simulation
+runs.
+"""
 function print_uconn_mpc_status(
     io::IO,
     ctrl::MPCController,
@@ -143,6 +209,17 @@ function print_uconn_mpc_status(
     return nothing
 end
 
+"""
+    build_controller(sys, sol; cfg=MPCConfig(), y_sym=sys.reactor5.x[4])
+
+Build the reusable JuMP-based MPC controller for the UConn ASM3 flowsheet.
+
+This is the expensive one-time setup step. The function:
+1. allocates state and control trajectories,
+2. registers the ODE prediction model,
+3. adds move-rate and tracking constraints,
+4. builds the objective terms used by the notebook logs.
+"""
 function build_controller(sys, sol; cfg::MPCConfig = MPCConfig(), y_sym = sys.reactor5.x[4])
     PH, CH, Δt = cfg.PH, cfg.CH, cfg.Δt
     N = PH + 1
@@ -156,6 +233,9 @@ function build_controller(sys, sol; cfg::MPCConfig = MPCConfig(), y_sym = sys.re
     set_optimizer_attribute(model, "print_level", 0)
     cfg.verbose || set_silent(model)
 
+    # The notebook controller only keeps the five reactor state blocks. This is
+    # the smallest state set that still matches the latest working local ASM3
+    # MPC setup.
     reactor_syms = (:reactor1, :reactor2, :reactor3, :reactor4, :reactor5)
     x_lb = fill(0.0, 13)
     x_ub = [20.0; fill(1.0e6, 12)...]
@@ -176,6 +256,8 @@ function build_controller(sys, sol; cfg::MPCConfig = MPCConfig(), y_sym = sys.re
     for rname in reactor_syms
         r = getproperty(sys, rname)
         for i in 1:13
+            # Each reactor state becomes one trajectory over the prediction
+            # horizon. These are the core decision trajectories of the MPC.
             traj = @variable(
                 model,
                 [1:N],
@@ -188,10 +270,9 @@ function build_controller(sys, sol; cfg::MPCConfig = MPCConfig(), y_sym = sys.re
         end
     end
 
-    # The local refined ASM3 MPC only carries the five reactor states plus the
-    # minimal algebraic flow trajectories that survive structural simplification
-    # in the UConn flowsheet. Keeping this scope small is what avoids the
-    # time-limit behavior seen with the broader unknown-state registration path.
+    # A few algebraic flow variables still need trajectories because the
+    # structurally simplified flowsheet keeps them in the ODE residuals. This
+    # smaller set is what avoids the old time-limit behavior.
     aux_flow_rhs = Dict(
         sys.splitter1.In.flow_rate => Ini2vecflow,
         sys.mixer1.Out1.flow_rate => 1.5 * Ini2vecflow,
@@ -211,6 +292,8 @@ function build_controller(sys, sol; cfg::MPCConfig = MPCConfig(), y_sym = sys.re
         c_ic[var_mtk] = _mk_ic!(model, traj, var_mtk; override = u0_full, rhs0 = float(rhs0))
     end
 
+    # The manipulated variables are the aeration coefficients in reactors 2 and
+    # 4. They are allowed to move freely only over the control horizon.
     @variable(model, cfg.KLa_min <= KLa2[1:N] <= cfg.KLa_max, base_name = "KLa2")
     @variable(model, cfg.KLa_min <= KLa4[1:N] <= cfg.KLa_max, base_name = "KLa4")
 
@@ -222,6 +305,8 @@ function build_controller(sys, sol; cfg::MPCConfig = MPCConfig(), y_sym = sys.re
     iv_MTK = ModelingToolkit.get_iv(sys)
     iv_map = Dict(iv_MTK => iv_JuMP)
 
+    # Register the prediction model once. After this, each MPC trigger only
+    # updates ICs, setpoints, and warm-start guesses before re-solving.
     register_odesystem(
         model,
         sys,
@@ -235,6 +320,7 @@ function build_controller(sys, sol; cfg::MPCConfig = MPCConfig(), y_sym = sys.re
     )
 
     if Nc < N
+        # After the control horizon ends, hold the last move constant.
         for k in (Nc + 1):N
             @constraint(model, KLa2[k] == KLa2[Nc])
             @constraint(model, KLa4[k] == KLa4[Nc])
@@ -260,6 +346,8 @@ function build_controller(sys, sol; cfg::MPCConfig = MPCConfig(), y_sym = sys.re
     @variable(model, s_up[1:N] >= 0)
     @variable(model, s_dn[1:N] >= 0)
 
+    # These soft constraints let the controller violate the setpoint band if it
+    # must, but every violation is penalized in the objective.
     @constraint(model, [k = 1:N], x_vars[y_sym][k] <= sp_param + s_up[k])
     @constraint(model, [k = 1:N], x_vars[y_sym][k] >= sp_param - s_dn[k])
 
@@ -279,6 +367,8 @@ function build_controller(sys, sol; cfg::MPCConfig = MPCConfig(), y_sym = sys.re
         (24 * cfg.Δt) * cfg.α * cfg.V * sum(KLa2[k] + KLa4[k] for k = 1:N),
     )
 
+    # The full objective is stored in named pieces so the notebook can report
+    # how much each modeling choice contributes at every solve.
     @objective(model, Min, term_tr + term_soft + term_d + term_d1 + cfg.w_energy * term_energy)
 
     return MPCController(
@@ -306,6 +396,14 @@ function build_controller(sys, sol; cfg::MPCConfig = MPCConfig(), y_sym = sys.re
     ), u0_dict
 end
 
+"""
+    warm_start_trajectories!(ctrl)
+
+Shift the previously solved trajectories forward by one stage.
+
+Warm starts are important in MPC because consecutive optimization problems are
+similar. Reusing the last solution often reduces solve time significantly.
+"""
 function warm_start_trajectories!(ctrl::MPCController)
     if ctrl.last_state_trajs !== nothing
         for (var, traj) in ctrl.x_vars
@@ -330,16 +428,40 @@ function warm_start_trajectories!(ctrl::MPCController)
     return nothing
 end
 
+"""
+    setpoint!(ctrl, sp_new)
+
+Update the tracked setpoint of the controller in place.
+
+The controller model is reused, so changing the setpoint simply means updating
+the fixed JuMP parameter used in the objective and soft constraints.
+"""
 function setpoint!(ctrl::MPCController, sp_new::Real)
     JuMP.fix(ctrl.sp_param, float(sp_new); force = true)
     return nothing
 end
 
+"""
+    make_logctx(sys)
+
+Create the log container used by the closed-loop notebook example.
+
+The returned object also stores a fast state-index map so callbacks can extract
+the tracked state from the ODE integrator without recomputing symbol lookups.
+"""
 function make_logctx(sys)
     unk = unknowns(sys)
     return UConnMPCLog(i_state = Dict(var => i for (i, var) in pairs(unk)))
 end
 
+"""
+    _log_current_state!(logctx, ctrl, integ)
+
+Append the current plant state and applied controls to the log.
+
+This helper is called from the logging callback so the notebook can later plot
+the closed-loop trajectories.
+"""
 function _log_current_state!(logctx::UConnMPCLog, ctrl::MPCController, integ)
     y_idx = logctx.i_state[ctrl.y_sym]
     push!(logctx.ts, float(integ.t))
@@ -350,11 +472,25 @@ function _log_current_state!(logctx::UConnMPCLog, ctrl::MPCController, integ)
     return nothing
 end
 
+"""
+    mpc_solve_step!(ctrl, integ, logctx=nothing)
+
+Run one online MPC update.
+
+The function performs the standard receding-horizon sequence:
+1. copy the current plant state into the IC constraints,
+2. enforce first-move consistency with the previously applied input,
+3. warm start the optimization variables,
+4. solve the JuMP model,
+5. apply the first move if the solve status is acceptable,
+6. record metrics and print a status line.
+"""
 function mpc_solve_step!(ctrl::MPCController, integ, logctx::Union{Nothing, UConnMPCLog}=nothing)
     cfg = ctrl.cfg
     sys = ctrl.sys
     i_state = logctx === nothing ? Dict(var => i for (i, var) in pairs(unknowns(sys))) : logctx.i_state
 
+    # Refresh all state IC constraints from the latest simulated plant state.
     for (var, cref) in ctrl.c_ic
         JuMP.set_normalized_rhs(cref, float(integ.u[i_state[var]]))
     end
@@ -364,6 +500,8 @@ function mpc_solve_step!(ctrl::MPCController, integ, logctx::Union{Nothing, UCon
     JuMP.set_normalized_rhs(ctrl.c_d1_2, K2_prev)
     JuMP.set_normalized_rhs(ctrl.c_d1_4, K4_prev)
 
+    # Tighten the first move so it cannot jump further than the allowed
+    # move-rate limit from the previously applied value.
     JuMP.set_lower_bound(ctrl.KLa2[1], max(cfg.KLa_min, K2_prev - cfg.ΔKLa_max))
     JuMP.set_upper_bound(ctrl.KLa2[1], min(cfg.KLa_max, K2_prev + cfg.ΔKLa_max))
     JuMP.set_lower_bound(ctrl.KLa4[1], max(cfg.KLa_min, K4_prev - cfg.ΔKLa_max))
@@ -376,6 +514,8 @@ function mpc_solve_step!(ctrl::MPCController, integ, logctx::Union{Nothing, UCon
     accepted = is_accepted_mpc_status(st; accepted_statuses = default_mpc_accepted_statuses())
 
     info = if accepted && JuMP.has_values(ctrl.model)
+        # Apply only the first optimized move. The rest of the optimized
+        # trajectory is used only as a prediction and warm start.
         K2 = float(JuMP.value(ctrl.KLa2[1]))
         K4 = float(JuMP.value(ctrl.KLa4[1]))
         abs(K2 - K2_prev) < 1e-3 && (K2 = K2_prev)
@@ -440,6 +580,17 @@ function mpc_solve_step!(ctrl::MPCController, integ, logctx::Union{Nothing, UCon
     return integ.ps[sys.reactor2.KLa], integ.ps[sys.reactor4.KLa], info
 end
 
+"""
+    run_uconn_closed_loop_mpc(sys, sol; ...)
+
+Run the full closed-loop UConn ASM3 MPC demonstration.
+
+This helper wires together:
+1. the reusable controller,
+2. the ODE plant simulation,
+3. callbacks for logging, MPC triggers, and setpoint changes,
+4. the final DataFrame used by the notebook plots.
+"""
 function run_uconn_closed_loop_mpc(
     sys,
     sol;
@@ -490,6 +641,8 @@ function run_uconn_closed_loop_mpc(
         sys.clarifier.inlet_stream.flow_rate => Ini2vecflow,
         sys.clarifier.recycle_stream.flow_rate => 0.4 * Ini2vecflow,
     )
+    # The plant simulation still needs a few flow guesses for stable
+    # initialization of the full ASM3 flowsheet.
     prob_cl = ODEProblem(
         sys,
         u0_dict,

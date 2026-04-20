@@ -13,6 +13,11 @@
 # - a larger plant model,
 # - a real closed-loop simulation,
 # - logging and CSV export for later analysis.
+#
+# Live status output comes in two layers:
+# - the generic `solve_tracking_mpc!(...; show_status=true)` line from the
+#   package itself,
+# - and an NDMC-specific line that adds disturbance and prediction details.
 
 import Pkg
 
@@ -25,6 +30,7 @@ using ModelingToolkit: t_nounits as t, D_nounits as D
 using JuMP, Ipopt
 using OrdinaryDiffEq, DiffEqCallbacks
 using DataFrames, CSV
+using Printf
 
 const NDMC_LEGACY_DT = 20.0
 const NDMC_LEGACY_PSPAN = 400.0
@@ -52,21 +58,55 @@ const GENERATED_DIR = joinpath(@__DIR__, "generated")
 # Smooth positive-part helper. This avoids a hard kink at zero.
 smooth_nonnegative(x) = 0.5 * (x + sqrt(x * x + NDMC_SMOOTH_POS_EPS^2))
 
+"""
+    ndmc_rate_term(cO)
+
+Return the approximate nitrification rate used by the NDMC example.
+
+This helper isolates the oxygen-dependent biology term so the plant equations
+read more clearly. New readers can treat this as the "how fast do reactions
+consume ammonium right now?" calculation.
+"""
 function ndmc_rate_term(cO)
     cO_pos = smooth_nonnegative(cO)
     return NDMC_R_AOMAX * (cO_pos / (NDMC_K_OAO + cO_pos)) * NDMC_X_AO * 0.001 / 60.0 / NDMC_M_N
 end
 
+"""
+    ndmc_conductivity_sink(cO)
+
+Convert the nitrification rate into the conductivity sink term used in the
+conductivity balances.
+
+The NDMC states are conductivity-like quantities, so the biological reaction
+rate is converted into the matching conductivity units here.
+"""
 function ndmc_conductivity_sink(cO)
     rate = ndmc_rate_term(cO)
     return (NDMC_LA0 - (NDMC_A + NDMC_B * NDMC_LA0) * sqrt(rate)) * rate * 1e3
 end
 
+"""
+    ndmc_oxygen_sink(cO)
+
+Return the oxygen-consumption term used in the dissolved-oxygen balance.
+
+This uses the same biological rate logic as `ndmc_rate_term(...)`, but keeps
+the result in oxygen units for the aeration state equation.
+"""
 function ndmc_oxygen_sink(cO)
     cO_pos = smooth_nonnegative(cO)
     return (NDMC_R_AOMAX * (cO_pos / (NDMC_K_OAO + cO_pos))) * NDMC_PHI_OAO * NDMC_X_AO / 60.0
 end
 
+"""
+    ndmc_k_vector()
+
+Return the calibrated mixing/transport coefficients used by the NDMC plant.
+
+The script stores the high- and medium-loading values from the legacy case and
+then averages them to get one public demonstration parameter set.
+"""
 function ndmc_k_vector()
     k1_hi = 2.37570423107917e-03
     k2_hi = 1.41065048786101e-03
@@ -85,6 +125,15 @@ function ndmc_k_vector()
     return (1000.0 / 0.38) .* [k1, k2, k3, k4]
 end
 
+"""
+    NDMCMPCConfig
+
+Configuration bundle for the public NDMC closed-loop example.
+
+Keeping the settings in one struct makes the example easier to read: all case
+assumptions, bounds, horizons, and disturbance settings live in one place
+instead of being scattered across the script.
+"""
 Base.@kwdef struct NDMCMPCConfig
     simulation_span::Tuple{Float64, Float64} = (0.0, 4000.0)
     dt::Float64 = NDMC_LEGACY_DT
@@ -109,8 +158,22 @@ Base.@kwdef struct NDMCMPCConfig
     state_upper::NTuple{5, Float64} = (600.0, 600.0, 600.0, 600.0, 20.0)
     ipopt_tol::Float64 = 1e-6
     ipopt_max_cpu_time::Float64 = 60.0
+    show_detailed_status::Bool = true
+    show_generic_status::Bool = false
+    status_digits::Int = 3
+    status_prefix::String = "[NDMC MPC]"
+    status_stream::Symbol = :stdout
 end
 
+"""
+    load_config_from_env()
+
+Build one `NDMCMPCConfig` from environment variables.
+
+This is a convenience wrapper for two common use cases:
+- run the example with the public defaults;
+- override horizons or simulation length in CI or quick local smoke tests.
+"""
 function load_config_from_env()
     # Read the case settings from environment variables.
     # This lets the same public example run both:
@@ -168,7 +231,90 @@ function load_config_from_env()
         ),
         ipopt_tol = parse(Float64, get(ENV, "NDMC_IPOPT_TOL", "1e-6")),
         ipopt_max_cpu_time = parse(Float64, get(ENV, "NDMC_IPOPT_MAX_CPU_TIME", "60.0")),
+        show_detailed_status = lowercase(strip(get(ENV, "NDMC_SHOW_DETAILED_STATUS", "true"))) in ("1", "true", "yes", "on"),
+        show_generic_status = lowercase(strip(get(ENV, "NDMC_SHOW_GENERIC_STATUS", "false"))) in ("1", "true", "yes", "on"),
+        status_digits = parse(Int, get(ENV, "NDMC_STATUS_DIGITS", "3")),
+        status_prefix = get(ENV, "NDMC_STATUS_PREFIX", "[NDMC MPC]"),
+        status_stream = begin
+            stream = Symbol(lowercase(strip(get(ENV, "NDMC_STATUS_STREAM", "stdout"))))
+            stream in (:stdout, :stderr) || error("NDMC_STATUS_STREAM must be `stdout` or `stderr`.")
+            stream
+        end,
     )
+end
+
+"""
+    _ndmc_status_io(cfg)
+
+Return the IO stream used by the NDMC live-status printer.
+"""
+function _ndmc_status_io(cfg::NDMCMPCConfig)
+    if cfg.status_stream === :stdout
+        return stdout
+    elseif cfg.status_stream === :stderr
+        return stderr
+    end
+    error("Unsupported NDMC status stream $(cfg.status_stream). Use :stdout or :stderr.")
+end
+
+"""
+    _fmt_ndmc_scalar(x; digits=3)
+
+Format one scalar for NDMC live-status output.
+"""
+function _fmt_ndmc_scalar(x; digits::Int = 3)
+    if x isa Real && isfinite(float(x))
+        return @sprintf("%.*f", digits, float(x))
+    end
+    return "NaN"
+end
+
+"""
+    print_ndmc_mpc_status(io, cfg, sys, result, state_values, q_prev, q_apply, cin_now, t_now, step)
+
+Print one NDMC-specific live status line after an MPC trigger.
+
+This complements the generic `show_status=true` support in
+`solve_tracking_mpc!(...)` by adding scenario-specific fields such as the
+influent shock values and the next/terminal `C3` prediction.
+"""
+function print_ndmc_mpc_status(io::IO,
+                               cfg::NDMCMPCConfig,
+                               sys,
+                               result,
+                               state_values::AbstractDict,
+                               q_prev::Real,
+                               q_apply::Real,
+                               cin_now,
+                               t_now::Real,
+                               step::Integer)
+    accepted = is_accepted_mpc_status(result.status; accepted_statuses = default_mpc_accepted_statuses())
+    pred_c3 = get(result.predictions, sys.C3, Float64[])
+    pred_c3_next = length(pred_c3) >= 2 ? pred_c3[2] : NaN
+    pred_c3_terminal = isempty(pred_c3) ? NaN : pred_c3[end]
+
+    parts = String[
+        cfg.status_prefix,
+        "step=" * string(step),
+        "t=" * _fmt_ndmc_scalar(t_now; digits = cfg.status_digits),
+        "status=" * string(result.status),
+        "accepted=" * string(accepted),
+        "obj=" * _fmt_ndmc_scalar(get(result.metrics, :objective, NaN); digits = cfg.status_digits),
+        "C1=" * _fmt_ndmc_scalar(get(state_values, sys.C1, NaN); digits = cfg.status_digits) * " (sp=" * _fmt_ndmc_scalar(cfg.setpoint; digits = cfg.status_digits) * ")",
+        "C2=" * _fmt_ndmc_scalar(get(state_values, sys.C2, NaN); digits = cfg.status_digits) * " (sp=" * _fmt_ndmc_scalar(cfg.setpoint; digits = cfg.status_digits) * ")",
+        "C3=" * _fmt_ndmc_scalar(get(state_values, sys.C3, NaN); digits = cfg.status_digits) * " (sp=" * _fmt_ndmc_scalar(cfg.setpoint; digits = cfg.status_digits) * ")",
+        "Q_prev=" * _fmt_ndmc_scalar(q_prev; digits = cfg.status_digits),
+        "Q_apply=" * _fmt_ndmc_scalar(q_apply; digits = cfg.status_digits),
+        "Cin1=" * _fmt_ndmc_scalar(cin_now[1]; digits = cfg.status_digits),
+        "Cin2=" * _fmt_ndmc_scalar(cin_now[2]; digits = cfg.status_digits),
+        "Cin3=" * _fmt_ndmc_scalar(cin_now[3]; digits = cfg.status_digits),
+        "pred_C3_next=" * _fmt_ndmc_scalar(pred_c3_next; digits = cfg.status_digits),
+        "pred_C3_terminal=" * _fmt_ndmc_scalar(pred_c3_terminal; digits = cfg.status_digits),
+    ]
+
+    println(io, string(first(parts), " ", join(parts[2:end], " | ")))
+    flush(io)
+    return nothing
 end
 
 @mtkmodel NDMCPlant begin
@@ -198,6 +344,15 @@ end
     end
 end
 
+"""
+    build_ndmc_system(cfg)
+
+Construct the ModelingToolkit system used by both the simulated plant and the
+prediction model.
+
+The example deliberately uses the same equations for plant and controller so
+new users can focus on the MPC workflow instead of plant-model mismatch.
+"""
 function build_ndmc_system(cfg::NDMCMPCConfig)
     # Build the MTK plant used by the controller and the ODE simulation.
     # The same MTK system is used in two roles:
@@ -217,6 +372,14 @@ function build_ndmc_system(cfg::NDMCMPCConfig)
     return sys
 end
 
+"""
+    ndmc_initial_state(sys, cfg)
+
+Return the initial state dictionary in ModelingToolkit key form.
+
+The controller builders in `EOptInterface` expect state updates keyed by the
+symbolic MTK states, so this helper performs that small translation once.
+"""
 function ndmc_initial_state(sys, cfg::NDMCMPCConfig)
     # Build the initial state dictionary in MTK key form.
     # Using MTK keys here keeps the script consistent with the public MPC API.
@@ -229,6 +392,14 @@ function ndmc_initial_state(sys, cfg::NDMCMPCConfig)
     )
 end
 
+"""
+    disturbance_triplet(t_now, cfg)
+
+Return the influent conductivity values active at time `t_now`.
+
+Outside the disturbance window the plant stays at its baseline feed. Inside the
+window, the configured shock values are applied.
+"""
 function disturbance_triplet(t_now::Real, cfg::NDMCMPCConfig)
     # Return the current influent conductivity triplet.
     # Outside the disturbance window the plant stays at the baseline feed.
@@ -238,6 +409,15 @@ function disturbance_triplet(t_now::Real, cfg::NDMCMPCConfig)
     return (cfg.Cs, cfg.Cs, cfg.Cs)
 end
 
+"""
+    build_ndmc_controller(sys; cfg)
+
+Build the reusable NDMC tracking MPC controller.
+
+This is the one-time setup step. It creates the JuMP model, registers the plant
+equations, and adds the tracking objective and control constraints. The online
+loop later reuses this controller at every trigger.
+"""
 function build_ndmc_controller(sys; cfg::NDMCMPCConfig)
     # Build the reusable tracking MPC controller once.
     # This is the one-time setup step.
@@ -303,6 +483,14 @@ function build_ndmc_controller(sys; cfg::NDMCMPCConfig)
     return ctrl
 end
 
+"""
+    set_plant_disturbance!(integ, sys, cfg, t_now)
+
+Write the currently active disturbance into the simulated ODE integrator.
+
+This updates the plant model only. The MPC disturbance preview is handled
+separately by `update_disturbance_forecast!(...)`.
+"""
 function set_plant_disturbance!(integ, sys, cfg::NDMCMPCConfig, t_now::Real)
     # Write the current disturbance into the ODE integrator parameters.
     # This changes the simulated plant only.
@@ -314,6 +502,15 @@ function set_plant_disturbance!(integ, sys, cfg::NDMCMPCConfig, t_now::Real)
     return nothing
 end
 
+"""
+    update_disturbance_forecast!(ctrl, sys, cfg, t_now)
+
+Update the stage-by-stage disturbance preview seen by the controller.
+
+If `cfg.use_disturbance_forecast` is `false`, the controller assumes the
+current disturbance will stay constant across the horizon. If it is `true`,
+this helper builds a full preview over the prediction horizon.
+"""
 function update_disturbance_forecast!(ctrl::TrackingMPCController, sys, cfg::NDMCMPCConfig, t_now::Real)
     # Update the fixed stage preview used by the MPC model.
     # If `use_disturbance_forecast=false`, the controller only sees the current
@@ -334,25 +531,83 @@ function update_disturbance_forecast!(ctrl::TrackingMPCController, sys, cfg::NDM
     return ctrl
 end
 
-function solve_ndmc_step!(ctrl::TrackingMPCController, sys, cfg::NDMCMPCConfig, state_values::AbstractDict, q_prev::Real, t_now::Real)
+"""
+    solve_ndmc_step!(ctrl, sys, cfg, state_values, q_prev, t_now)
+
+Solve one MPC step for the NDMC example.
+
+This wrapper performs the NDMC-specific online work in the correct order:
+1. refresh the disturbance preview,
+2. solve the generic tracking MPC problem,
+3. optionally print generic and/or NDMC-specific live status lines,
+4. return the first control move that should be applied to the plant.
+"""
+function solve_ndmc_step!(ctrl::TrackingMPCController,
+                          sys,
+                          cfg::NDMCMPCConfig,
+                          state_values::AbstractDict,
+                          q_prev::Real,
+                          t_now::Real;
+                          step::Union{Nothing, Integer} = nothing)
     # Update the preview, solve the MPC, and return the first move.
     # This helper is the NDMC-specific wrapper around the generic public
     # function `solve_tracking_mpc!(...)`.
     update_disturbance_forecast!(ctrl, sys, cfg, t_now)
+    cin_now = disturbance_triplet(t_now, cfg)
     result = solve_tracking_mpc!(
         ctrl,
         state_values,
         Dict(sys.Q_air => q_prev);
         lower_clip = 0.0,
+        show_status = cfg.show_generic_status,
+        status_io = _ndmc_status_io(cfg),
+        status_time = t_now,
+        status_output_syms = [sys.C1, sys.C2, sys.C3],
+        status_control_syms = [sys.Q_air],
+        status_digits = cfg.status_digits,
+        status_prefix = cfg.status_prefix,
     )
     q_apply = result.controls[sys.Q_air][1]
+    if abs(q_apply - q_prev) < 1e-8
+        q_apply = q_prev
+    end
+    if cfg.show_detailed_status
+        print_ndmc_mpc_status(
+            _ndmc_status_io(cfg),
+            cfg,
+            sys,
+            result,
+            state_values,
+            q_prev,
+            q_apply,
+            cin_now,
+            t_now,
+            something(step, -1),
+        )
+    end
     return (q_apply = q_apply, result = result)
 end
 
+"""
+    metric_column(logctx, key)
+
+Return one logged metric column, or `NaN` values if that metric was not stored.
+
+This keeps the CSV export section simple and avoids repeated missing-key checks.
+"""
 function metric_column(logctx::MPCLog, key::Symbol)
     return get(logctx.Metrichist, key, fill(NaN, length(logctx.pred_times)))
 end
 
+"""
+    main()
+
+Run the full public NDMC closed-loop example and save the results to CSV.
+
+This is the script-level entry point. It builds the plant and controller,
+runs the receding-horizon simulation with callbacks, and exports the histories
+used by the notebooks and plots.
+"""
 function main()
     mkpath(GENERATED_DIR)
 
@@ -361,8 +616,12 @@ function main()
     sys = build_ndmc_system(cfg)
     state0 = ndmc_initial_state(sys, cfg)
     ctrl = build_ndmc_controller(sys; cfg = cfg)
+    mpc_step = Ref(0)
 
-    initial = solve_ndmc_step!(ctrl, sys, cfg, state0, cfg.Q_init, cfg.simulation_span[1])
+    # Solve once at the initial state so the plant starts with a consistent
+    # first applied move and the logs already contain one prediction snapshot.
+    initial = solve_ndmc_step!(ctrl, sys, cfg, state0, cfg.Q_init, cfg.simulation_span[1]; step = mpc_step[])
+    mpc_step[] += 1
     initial_q = initial.q_apply
     initial_cin = disturbance_triplet(cfg.simulation_span[1], cfg)
 
@@ -380,6 +639,7 @@ function main()
     record_mpc_metrics!(logctx, initial.result.metrics; missing = :skip)
     seed_mpc_log!(logctx, state0, cfg.simulation_span[1]; control_values = Dict(sys.Q_air => initial_q))
 
+    # These are the parameter values carried by the simulated plant.
     p0 = Dict(
         sys.Q_air => initial_q,
         sys.Cin1 => initial_cin[1],
@@ -389,20 +649,24 @@ function main()
 
     prob_cl = ODEProblem(sys, merge(state0, p0), cfg.simulation_span)
 
+    # Separate trigger grids are used for control updates and logging. This lets
+    # us log at one cadence even if we later choose a different control period.
     times_ctrl = collect((cfg.simulation_span[1] + cfg.dt):cfg.dt:cfg.simulation_span[2])
     times_log = collect((cfg.simulation_span[1] + cfg.save_dt):cfg.save_dt:cfg.simulation_span[2])
     disturbance_times = unique(filter(t -> cfg.simulation_span[1] <= t <= cfg.simulation_span[2], [cfg.disturbance_start, cfg.disturbance_stop]))
 
     function mpc_affect!(integ)
-        # MPC callback: update disturbance, solve MPC, and apply the first move.
+        # Order matters here:
+        # 1. write the currently active disturbance into the plant,
+        # 2. read the latest plant state,
+        # 3. solve MPC,
+        # 4. apply only the first move from the optimized trajectory.
         set_plant_disturbance!(integ, sys, cfg, integ.t)
         state_values = current_state_map(integ, sys)
         q_prev = integ.ps[sys.Q_air]
-        solved = solve_ndmc_step!(ctrl, sys, cfg, state_values, q_prev, integ.t)
+        solved = solve_ndmc_step!(ctrl, sys, cfg, state_values, q_prev, integ.t; step = mpc_step[])
+        mpc_step[] += 1
         q_apply = solved.q_apply
-        if abs(q_apply - q_prev) < 1e-8
-            q_apply = q_prev
-        end
         integ.ps[sys.Q_air] = q_apply
         record_mpc_prediction!(logctx, integ.t, solved.result.predictions)
         record_mpc_metrics!(logctx, solved.result.metrics; missing = :skip)
@@ -410,13 +674,14 @@ function main()
     end
 
     function disturbance_affect!(integ)
-        # Disturbance-only callback for the plant model.
+        # This callback keeps the plant disturbance synchronized at the exact
+        # window boundaries even between control triggers.
         set_plant_disturbance!(integ, sys, cfg, integ.t)
         return nothing
     end
 
     function log_affect!(integ)
-        # Logging callback for states and applied control.
+        # Log the plant state after the most recent control/disturbance updates.
         log_mpc_state!(logctx, integ; control_values = Dict(sys.Q_air => integ.ps[sys.Q_air]), missing_control = :hold)
         return nothing
     end

@@ -27,6 +27,44 @@
 # ------------------------------------------------------------------------------
 
 """
+    _canonical_parameter_var_dict(sys, data)
+
+Internal helper that rewrites a dictionary so all keys are the standard
+parameter symbols from `parameters(sys)`.
+
+This matters because users may pass different but equivalent MTK names.
+The rest of the package wants one consistent key form before it writes JuMP
+variables into the MPC model.
+"""
+function _canonical_parameter_var_dict(sys, data::AbstractDict)
+    out = Dict{Num, Vector{JuMP.VariableRef}}()
+    for (sym, vars) in pairs(data)
+        # Convert each input name to the standard MTK parameter key.
+        out[canonical_system_parameter(sys, sym)] = vars
+    end
+    return out
+end
+
+"""
+    _canonical_state_var_dict(sys, data)
+
+Internal helper that rewrites a dictionary so all keys are the standard state
+symbols from `unknowns(sys)`.
+
+This is the state-side companion to `_canonical_parameter_var_dict(...)`.
+It keeps later IC and trajectory updates keyed by one canonical MTK symbol set.
+"""
+function _canonical_state_var_dict(sys, data::AbstractDict)
+    out = Dict{Num, Vector{JuMP.VariableRef}}()
+    for (sym, vars) in pairs(data)
+        # Do the same thing for states.
+        out[canonical_system_unknown(sys, sym)] = vars
+    end
+    return out
+end
+
+# original decision_vars function that just calls the more general one with defaults
+"""
     decision_vars(sys)
     decision_vars(sys, ps; model=nothing, horizon=nothing, build_state_trajs=false, ...)
 
@@ -64,25 +102,6 @@ Algorithm:
    allocate one JuMP trajectory and one IC constraint per state.
 6. Return the symbol list together with the trajectory containers.
 """
-function _canonical_parameter_var_dict(sys, data::AbstractDict)
-    out = Dict{Num, Vector{JuMP.VariableRef}}()
-    for (sym, vars) in pairs(data)
-        # Convert each input name to the standard MTK parameter key.
-        out[canonical_system_parameter(sys, sym)] = vars
-    end
-    return out
-end
-
-function _canonical_state_var_dict(sys, data::AbstractDict)
-    out = Dict{Num, Vector{JuMP.VariableRef}}()
-    for (sym, vars) in pairs(data)
-        # Do the same thing for states.
-        out[canonical_system_unknown(sys, sym)] = vars
-    end
-    return out
-end
-
-# original decision_vars function that just calls the more general one with defaults
 function decision_vars(sys::ModelingToolkit.System)
     return decision_vars(sys, Num[];
                          model=nothing,
@@ -191,6 +210,14 @@ function ensure_ic!(model::JuMP.Model,
     return nothing
 end
 
+"""
+    to_num_key_map(u0_dict)
+
+Return a copy of `u0_dict` with all keys converted to `Num`.
+
+This is a small compatibility helper for older code paths that may still store
+initial-condition dictionaries under other symbolic key types.
+"""
 function to_num_key_map(u0_dict)
     # u0_dict :: Dict{BasicSymbolic{Real}, Float64}
     # return :: Dict{Num, Float64}
