@@ -1,28 +1,155 @@
-"""
-    decision_vars(sys, ps)
+﻿# ------------------------------------------------------------------------------
+# Low-level MPC helpers
+#
+# This file turns a ModelingToolkit system into a JuMP model.
+# Most users will not call these functions directly.
+# The higher-level builder in `trackingmpc.jl` calls them.
+# If you are new to the package, think of this file as the "model registration"
+# layer. Its job is not to choose controls or solve the online loop. Its job is
+# to take one MTK model and write the matching JuMP variables and constraints.
+#
+# Main flow:
+# 1. `decision_vars(...)` picks the MTK symbols used in the problem.
+# 2. `register_odesystem(...)` or `register_daesystem(...)` adds the dynamics.
+# 3. `build_tracking_mpc(...)` builds the full MPC problem on top of that.
+# 4. `full_solutions(...)` maps solved values back to MTK symbols.
+#
+# Good reading order for new users:
+# 1. Read `decision_vars(...)` first.
+#    It answers the simple question: "Which MTK symbols become optimization
+#    variables?"
+# 2. Then read `register_odesystem(...)` or `register_daesystem(...)`.
+#    These functions answer the next question: "How do those variables satisfy
+#    the dynamic model over time?"
+# 3. Read `full_solutions(...)` last.
+#    It answers the reporting question: "How do I translate solved JuMP values
+#    back into MTK notation?"
+# ------------------------------------------------------------------------------
 
-Displays the decision variables for optimization problem of a ModelingToolkit model.
-`ps` specifies which MTK parameters (e.g., u_in_valve(t)) will be treated as decision variables (and can be discretized over time).
 """
-function decision_vars(sys::ModelingToolkit.System, ps::Vector{Num}=Num[])
-    # Parameters to optimize = user-specified ps ∪ parameters without default values
-    params_to_opt = union(ps, setdiff(ModelingToolkit.parameters(sys),
-                                      keys(ModelingToolkit.defaults(sys))))
-    return vcat(ModelingToolkit.unknowns(sys), collect(params_to_opt))
+    decision_vars(sys)
+    decision_vars(sys, ps; model=nothing, horizon=nothing, build_state_trajs=false, ...)
+
+Identify the ModelingToolkit symbols that should participate in an MPC or other
+dynamic optimization problem.
+
+What this function returns depends on `build_state_trajs`:
+- `build_state_trajs=false`:
+  returns a flat vector of symbols, consisting of
+  1. all MTK states (`unknowns(sys)`), and
+  2. the parameters in `ps`, plus any parameters without defaults.
+- `build_state_trajs=true`:
+  also creates one JuMP trajectory for every state and returns a named tuple with
+  `all`, `states`, `params`, `x_vars`, and `c_ic`.
+
+Why this function exists:
+- it gives the package one place to decide which MTK symbols go into the NLP;
+- it normalizes symbols, so callers can use either raw MTK symbols or names
+  like `sys.x`;
+- it can also build the state trajectories used by the ODE and DAE functions.
+
+How it connects to other functions:
+- `build_tracking_mpc(...)` calls this to get `x_vars` and `c_ic`;
+- `register_odesystem(...)` and `register_daesystem(...)` use those
+  trajectories;
+- `full_solutions(...)` uses the same symbol order when it reads values back.
+
+Algorithm:
+1. Read all MTK states from `unknowns(sys)`.
+2. Normalize the user-supplied parameter names in `ps`.
+3. Add any parameters that have no default value, because the NLP still needs
+   them.
+4. If `build_state_trajs=false`, return the final symbol list.
+5. If `build_state_trajs=true`, call `build_state_trajs_from_vars!(...)` to
+   allocate one JuMP trajectory and one IC constraint per state.
+6. Return the symbol list together with the trajectory containers.
+"""
+function _canonical_parameter_var_dict(sys, data::AbstractDict)
+    out = Dict{Num, Vector{JuMP.VariableRef}}()
+    for (sym, vars) in pairs(data)
+        # Convert each input name to the standard MTK parameter key.
+        out[canonical_system_parameter(sys, sym)] = vars
+    end
+    return out
 end
 
+function _canonical_state_var_dict(sys, data::AbstractDict)
+    out = Dict{Num, Vector{JuMP.VariableRef}}()
+    for (sym, vars) in pairs(data)
+        # Do the same thing for states.
+        out[canonical_system_unknown(sys, sym)] = vars
+    end
+    return out
+end
+
+# original decision_vars function that just calls the more general one with defaults
+function decision_vars(sys::ModelingToolkit.System)
+    return decision_vars(sys, Num[];
+                         model=nothing,
+                         horizon=nothing,
+                         build_state_trajs=false,
+                         lb=0.0,
+                         ub=1e6,
+                         rhs0=0.0,
+                         store_ext=true)
+end
+
+function decision_vars(sys::ModelingToolkit.System, ps::Vector{Num};
+                       model::Union{Nothing, JuMP.Model}=nothing,
+                       horizon::Union{Nothing, Int}=nothing,
+                       build_state_trajs::Bool=false,
+                       lb=0.0,
+                       ub=1e6,
+                       rhs0=0.0,
+                       store_ext::Bool=true)
+    # All MTK unknowns become state trajectories.
+    state_vars = collect(ModelingToolkit.unknowns(sys))
+    # Normalize parameter names first.
+    ps_canonical = canonicalize_system_symbols(sys, ps; pool=:parameters)
+    # Parameters without defaults must also be optimized.
+    params_to_opt = collect(union(ps_canonical, setdiff(ModelingToolkit.parameters(sys),
+                                                        keys(ModelingToolkit.defaults(sys)))))
+    all_vars = vcat(state_vars, params_to_opt)
+
+    build_state_trajs || return all_vars
+    isnothing(model) && error("decision_vars(...; build_state_trajs=true) requires `model`.")
+    isnothing(horizon) && error("decision_vars(...; build_state_trajs=true) requires `horizon`.")
+
+    # Build the JuMP state trajectories in the shared helper.
+    x_vars, c_ic = build_state_trajs_from_vars!(
+        model,
+        sys,
+        state_vars,
+        horizon;
+        lb = lb,
+        ub = ub,
+        rhs0 = rhs0,
+        store_ext = store_ext,
+    )
+
+    return (
+        all = all_vars,
+        states = state_vars,
+        params = params_to_opt,
+        x_vars = x_vars,
+        c_ic = c_ic,
+    )
+end
 """
     register_nlsystem(model, sys, obj, ineqs)
 
-Registers a ModelingToolkit algebraic model, objective function, and inequality constraints as algebraic constraints in JuMP.
+Register a purely algebraic ModelingToolkit system inside a JuMP model.
 
-# Arguments
-- `model::Model`: the JuMP model
-- `sys::System`: the ModelingToolkit model
-- `obj::Num`: a symbolic expression of the objective function using the ModelingToolkit model variables
-- `ineqs::Vector{Num}`: a vector of symbolic expressions of inequality constraints using the ModelingToolkit model variables
+Use this when the model has no time dynamics.
+It adds the MTK equations, the inequality constraints, and the objective.
+
+How it connects to other functions:
+- unlike the ODE and DAE functions, this one does not build trajectories;
+- it uses the same MTK-to-JuMP conversion tools;
+- it is separate from `build_tracking_mpc(...)`, which is for time-based MPC.
 """
 function register_nlsystem(model::JuMP.Model, sys::ModelingToolkit.System, obj::Symbolics.Num, ineqs::Vector{Symbolics.Num})
+    # Turn MTK expressions into callable JuMP expressions.
     h = EOptInterface.mtk_generate_model_equations(sys)
     f = EOptInterface.mtk_generate_reduced_expression(obj, sys)
     g = []
@@ -31,53 +158,33 @@ function register_nlsystem(model::JuMP.Model, sys::ModelingToolkit.System, obj::
         push!(g, gi)
     end
     JuMP.@constraint(model, [i in eachindex(h)], h[i](JuMP.all_variables(model)...) == 0)
-    JuMP.@constraint(model, [i in eachindex(g)], g[i](JuMP.all_variables(model)...) ≤ 0)
+    JuMP.@constraint(model, [i in eachindex(g)], g[i](JuMP.all_variables(model)...) >= 0)
     JuMP.@objective(model, Min, f(JuMP.all_variables(model)...))
 end
 
 """
-Ensure/override initial conditions at the first stage.
-- model: JuMP.Model
-- odesys: MTK system (for defaults)
-- x_vars: Dict{Num,Vector{VariableRef}}  # state -> trajectory vars
-- override_map: Dict{Num,<:Real}         # 优先使用的初值，键必须是同一个 u(t)
+    ensure_ic!(model, ic_map, x_vars, u, val)
+
+Ensure that the first point of a state trajectory has the chosen value.
+
+This function either updates an existing initial-condition constraint or
+creates it.
+
+How it connects to other functions:
+- `decision_vars(...; build_state_trajs=true)` and
+  `build_state_trajs_from_vars!(...)` create the initial-condition constraints
+  stored in `c_ic`;
+- `prepare_tracking_mpc_step!(...)` updates those constraints before each solve;
+- `get_ic_constraint!(...)` checks that the IC constraint is present.
 """
-# function ensure_ic!(model, odesys, x_vars; override_map=Dict{Num,Float64}())
-#     dflt = ModelingToolkit.defaults(odesys)  # MTK 默认初值
-#     unknowns = collect(keys(x_vars))         # 和 register 的同一批未知量
-
-#     for u in unknowns
-#         # 1) 取值优先级：override_map → defaults → 报错
-#         v0 = if haskey(override_map, u)
-#             float(override_map[u])
-#         elseif haskey(dflt, u)
-#             float(dflt[u])
-#         else
-#             error("No initial value for $u (not in override_map and no default).")
-#         end
-
-#         # 2) 取 t=1 的 JuMP 变量
-#         x1 = x_vars[u][1]
-
-#         # 3) 覆盖或新建等式约束
-#         try
-#             JuMP.set_normalized_rhs(x1, v0)     # 覆盖已有的 x1 == ...
-#         catch
-#             # println("No constraint for $x1; adding new constraint.")
-#             @constraint(model, x1 == v0)        # 尚未建约束 → 新建
-#         end
-#     end
-#     return nothing
-# end
-
-# ---- 放在文件顶部合适位置：一个小工具 ----
 function ensure_ic!(model::JuMP.Model,
                     ic_map::Dict{Any, JuMP.ConstraintRef},
                     x_vars::Dict, u, val)
     if haskey(ic_map, u)
-        # 这一步“就地改右端”，不会新增第二条约束
+        # Normal path: update the existing IC constraint.
         JuMP.set_normalized_rhs(ic_map[u], val)
     else
+        # Fallback path: create the IC constraint if it is missing.
         con = @constraint(model, x_vars[u][1] == val)
         ic_map[u] = con
     end
@@ -86,13 +193,25 @@ end
 
 function to_num_key_map(u0_dict)
     # u0_dict :: Dict{BasicSymbolic{Real}, Float64}
-    # 返回 :: Dict{Num, Float64}
+    # return :: Dict{Num, Float64}
     Dict( Num(k) => v for (k,v) in u0_dict )
 end
 
-# Ensures there is exactly one scalar-equality IC constraint for x[idx].
-# If none is found and rhs_if_missing is provided, adds one.
-# If more than one is found, deletes duplicates to keep the first.
+"""
+    get_ic_constraint!(model, x; idx=1, rhs_if_missing=nothing)
+
+Return the equality constraint for the first point of a trajectory.
+
+This helper looks for an equality on `x[idx]`.
+It returns the constraint if it exists.
+It can create the constraint if it is missing.
+It can also delete duplicates.
+
+How it connects to other functions:
+- `build_state_trajs_from_vars!(...)` creates the original IC constraints;
+- `ensure_ic!(...)` updates or adds them during online MPC use;
+- this helper is mainly for checking and repair.
+"""
 function get_ic_constraint!(model::JuMP.Model,
                             x::AbstractVector{<:JuMP.VariableRef};
                             idx::Int=1,
@@ -105,6 +224,7 @@ function get_ic_constraint!(model::JuMP.Model,
     for c in JuMP.all_constraints(model, JuMP.AffExpr, MOI.EqualTo{Float64})
         co = JuMP.constraint_object(c)
         terms = co.func.terms
+        # Only keep simple one-variable equalities.
         # Support both dict-like and vector-like term storage (JuMP version differences).
         if length(terms) == 1
             v = begin
@@ -122,10 +242,11 @@ function get_ic_constraint!(model::JuMP.Model,
 
     if isempty(hits)
         isnothing(rhs_if_missing) && error("No scalar IC equality found for $(JuMP.name(target))")
+        # Create the missing IC if the caller asks for it.
         return @constraint(model, target == rhs_if_missing)
     end
 
-    # Keep only one IC constraint; remove duplicates (helps avoid overconstraining).
+    # Keep one IC constraint and delete duplicates.
     for c in hits[2:end]
         JuMP.delete(model, c)
     end
@@ -133,27 +254,35 @@ function get_ic_constraint!(model::JuMP.Model,
 end
 
 """
-    register_odesystem(model, sys, tspan, tstep, integrator)
+    register_odesystem(model, sys, tspan, tstep, integrator; ...)
 
-Registers a ModelingToolkit dynamic model as algebraic constraints in JuMP by discretizing ODEs as a system of algebraic equations.
+Register a ModelingToolkit ODE system as JuMP constraints over time.
 
-- Supported integrators:
-  - "EE"       : Explicit Euler
-  - "IE"|"BDF1": Implicit Euler
-  - "RK4"      : Classical 4th-order Runge–Kutta
-  - "IRK4"     : 2-stage Gauss–Legendre implicit RK (order 4)
-  - "RADAU"|"RADAU5"|"RADAUIIA": 3-stage Radau IIA implicit RK (order 5)
-  - "BDF"|"BDF2": BDF2 with IE startup
-  - "RK5"|"DP5"|"DOPRI5": Dormand–Prince 5th-order explicit RK
-  - "ROS2"|"ROS"|"Rosenbrock": 2-stage Rosenbrock–W method (linearly implicit, order 2)
-  - "TSIT5"    : Tsitouras 5(4) explicit RK (7-stage, FSAL; step uses 6 stages)
-  - "TRBDF2"   : 2-stage SDIRK approximation of TR-BDF2 (L-stable, order 2)
-# Arguments
-- `model::Model`: the JuMP model
-- `sys::System`: the ModelingToolkit model
-- `tspan::Type{Number,Number}`: the time span over which the dynamic model is simulated
-- `tstep::Number`: the time step used in the integration scheme
-- `integrator::String`: integration scheme used in discretization (see list above)
+This function turns a continuous ODE into the step equations used by MPC.
+
+Supported integrators:
+- `"EE"`: Explicit Euler
+- `"IE"` / `"BDF1"`: Implicit Euler
+- `"RK4"`: Classical fourth-order Runge-Kutta
+- `"IRK4"`: two-stage Gauss-Legendre implicit Runge-Kutta
+
+How it connects to other functions:
+- `decision_vars(...; build_state_trajs=true)` or `build_state_trajs_from_vars!(...)`
+  creates the `x_vars` trajectories used here;
+- `_register_tracking_system!(...)` in `trackingmpc.jl` calls this when the user
+  selects `system_kind=:ode`;
+- `prepare_tracking_mpc_step!(...)` and `solve_tracking_mpc!(...)` do not
+  rebuild these constraints. They only update values and solve again.
+
+Algorithm:
+1. Build the time grid from `tspan` and `tstep`.
+2. Normalize state and parameter names so all later lookups use one MTK key.
+3. Turn each MTK right-hand side into a callable function of states, parameters,
+   and time.
+4. Read or infer the JuMP state trajectories `x_vars`.
+5. For each time step, add one set of discretization equations.
+6. The exact equations depend on `integrator`, for example Euler, RK4, or IRK4.
+7. Leave the built constraints in the model for repeated MPC solves.
 """
 
 function register_odesystem(model::JuMP.Model,
@@ -162,19 +291,23 @@ function register_odesystem(model::JuMP.Model,
                             tstep::Real,
                             integrator::String;
                             p_disc::Vector{Num}=Num[],
-                            p_disc_vars::Dict{Num,Vector{JuMP.VariableRef}}=Dict(),
-                            x_vars::Dict{Num,Vector{JuMP.VariableRef}}=Dict(),
-                            t_map::Dict{SymbolicUtils.BasicSymbolic{Real},JuMP.VariableRef}=Dict())
+                            p_disc_vars::Dict{Num,Vector{JuMP.VariableRef}}=Dict{Num,Vector{JuMP.VariableRef}}(),
+                            x_vars::AbstractDict=Dict(),
+                            t_map::Dict{SymbolicUtils.BasicSymbolic{Real},JuMP.VariableRef}=Dict{SymbolicUtils.BasicSymbolic{Real},JuMP.VariableRef}())
 
     # Time grid and dimensions
     N = Int(floor((tspan[2] - tspan[1]) / tstep)) + 1
     # State variable dimensions
     V = length(ModelingToolkit.unknowns(odesys))
+    # Normalize all user input names once at the start.
+    p_disc = canonicalize_system_symbols(odesys, p_disc; pool=:parameters)
+    p_disc_vars = _canonical_parameter_var_dict(odesys, p_disc_vars)
+    x_vars = _canonical_state_var_dict(odesys, x_vars)
 
     # Normalize integrator key
     intg = uppercase(integrator)
 
-    # 1) Generate RHS functions f_j(x, p) and (for Rosenbrock) Jacobian J(x, p)
+    # 1) Build callable right-hand-side functions.
     param_dict = copy(ModelingToolkit.defaults(odesys))
     for var in ModelingToolkit.unknowns(odesys)
         pop!(param_dict, var, nothing)
@@ -184,13 +317,13 @@ function register_odesystem(model::JuMP.Model,
     end
 
     t_MTK = ModelingToolkit.get_iv(odesys)
-    t0 = t_MTK
     t_at(i::Int; c::Real=0.0) = t_map[t_MTK] + (i-1 + c) * tstep
 
     dx = Vector{Function}(undef, V)
     dx_exprs = Vector{Symbolics.Num}(undef, V)
     full_eqs = ModelingToolkit.full_equations(odesys)
     for j in 1:V
+        # Turn each MTK right-hand side into a callable function.
         dxj_expr = full_eqs[j].rhs
         while !isempty(intersect(Symbolics.get_variables(dxj_expr), keys(param_dict)))
             dxj_expr = SymbolicUtils.substitute(dxj_expr, param_dict)
@@ -198,24 +331,24 @@ function register_odesystem(model::JuMP.Model,
         dx_exprs[j] = dxj_expr
         dx[j] = build_function(dxj_expr,
                             decision_vars(odesys, p_disc)..., t_MTK;
-                            expression = Val(false))
+                            expression = Val{false})
     end
 
-    # Jacobian function for Rosenbrock methods (evaluated at x_i)
+    # Jacobian function for Rosenbrock methods.
     Jfun = nothing
     if intg in ("ROS2", "ROS", "ROSENBROCK")
         J_expr = Symbolics.jacobian(dx_exprs, ModelingToolkit.unknowns(odesys))
         Jfun = build_function(J_expr, decision_vars(odesys, p_disc)..., t_MTK; expression = Val{false})
     end
 
-    # 2) Validate discretized parameter arrays
+    # 2) Check the discretized parameter arrays.
     for p in p_disc
         @assert haskey(p_disc_vars, p) "Missing p_disc_vars[$p] for $p (should have length N)"
         @assert length(p_disc_vars[p]) == N "p_disc_vars[$p] must have length N=$N"
     end
     flat_pvars = reduce(vcat, values(p_disc_vars); init=JuMP.VariableRef[])
 
-    # 3) Build the state matrix xs
+    # 3) Build the state matrix `xs`.
     unknowns = ModelingToolkit.unknowns(odesys)
     xs = Array{JuMP.VariableRef}(undef, V, N)
     if !isempty(x_vars)
@@ -225,26 +358,30 @@ function register_odesystem(model::JuMP.Model,
             xs[j, :] = x_vars[u]
         end
     else
+        # Old fallback path. Passing `x_vars` is safer.
         xs = reshape(setdiff(JuMP.all_variables(model), flat_pvars), V, N)
         @warn "register_odesystem: inferring state ordering from all_variables; pass x_vars=... to avoid mismatches."
     end
 
 
-    # 5) ODE discretization constraints
+    # 4) Add the ODE step constraints.
     for i in 1:(N-1)
         p_args_i   = [p_disc_vars[p][i] for p in p_disc]
 
         if intg == "EE"
             for j in 1:V
+                # Explicit Euler uses the current slope.
                 JuMP.@constraint(model, xs[j, i+1] == xs[j, i] + tstep * dx[j](xs[:, i]..., p_args_i..., t_at(i)))
             end
 
-        elseif intg == "IE" || intg == "BDF1"
+        elseif intg == "IE"
             for j in 1:V
+                # Implicit Euler uses the next slope.
                 JuMP.@constraint(model, xs[j, i+1] == xs[j, i] + tstep * dx[j](xs[:, i+1]..., p_args_i..., t_at(i, c=1.0)))
             end
 
         elseif intg == "RK4"
+            # RK4 uses four slope estimates.
             k1 = [dx[j](xs[:, i]..., p_args_i..., t_at(i)) for j in 1:V]
             xk1_half = [xs[j, i] + 0.5 * tstep * k1[j] for j in 1:V]
 
@@ -260,87 +397,8 @@ function register_odesystem(model::JuMP.Model,
                 JuMP.@constraint(model, xs[j, i+1] == xs[j, i] + (tstep/6) * (k1[j] + 2*k2[j] + 2*k3[j] + k4[j]))
             end
 
-        elseif intg == "RK5" || intg == "DP5" || intg == "DOPRI5"
-            # Dormand–Prince 5(4) explicit RK (7 stages), params constant during step
-            # Butcher tableau (c, A, b) for the 5th-order solution
-            # c
-            c2 = 1//5
-            c3 = 3//10
-            c4 = 4//5
-            c5 = 8//9
-            c6 = 1//1
-            c7 = 1//1
-            # A (lower triangular)
-            a21 = 1//5
-
-            a31 = 3//40;   a32  = 9//40
-
-            a41 = 44//45;  a42  = -56//15;  a43  = 32//9
-
-            a51 = 19372//6561; a52 = -25360//2187; a53 = 64448//6561; a54 = -212//729
-
-            a61 = 9017//3168;  a62 = -355//33;    a63 = 46732//5247; a64 = 49//176; a65 = -5103//18656
-
-            a71 = 35//384;     a72 = 0//1;        a73 = 500//1113;   a74 = 125//192; a75 = -2187//6784; a76 = 11//84
-            # b (5th order)
-            b1 = 35//384; b2 = 0//1; b3 = 500//1113; b4 = 125//192; b5 = -2187//6784; b6 = 11//84; b7 = 0//1
-
-            k1 = [dx[j](xs[:, i]..., p_args_i..., t_at(i)) for j in 1:V]
-
-            y2 = [xs[j, i] + tstep*(a21*k1[j]) for j in 1:V]
-            k2 = [dx[j](y2..., p_args_i..., t_at(i, c=c2)) for j in 1:V]
-
-            y3 = [xs[j, i] + tstep*(a31*k1[j] + a32*k2[j]) for j in 1:V]
-            k3 = [dx[j](y3..., p_args_i..., t_at(i, c=c3)) for j in 1:V]
-
-            y4 = [xs[j, i] + tstep*(a41*k1[j] + a42*k2[j] + a43*k3[j]) for j in 1:V]
-            k4 = [dx[j](y4..., p_args_i..., t_at(i, c=c4)) for j in 1:V]
-
-            y5 = [xs[j, i] + tstep*(a51*k1[j] + a52*k2[j] + a53*k3[j] + a54*k4[j]) for j in 1:V]
-            k5 = [dx[j](y5..., p_args_i..., t_at(i, c=c5)) for j in 1:V]
-
-            y6 = [xs[j, i] + tstep*(a61*k1[j] + a62*k2[j] + a63*k3[j] + a64*k4[j] + a65*k5[j]) for j in 1:V]
-            k6 = [dx[j](y6..., p_args_i..., t_at(i, c=c6)) for j in 1:V]
-
-            y7 = [xs[j, i] + tstep*(a71*k1[j] + a72*k2[j] + a73*k3[j] + a74*k4[j] + a75*k5[j] + a76*k6[j]) for j in 1:V]
-            k7 = [dx[j](y7..., p_args_i..., t_at(i, c=c7)) for j in 1:V]
-
-            for j in 1:V
-                JuMP.@constraint(model,
-                    xs[j, i+1] == xs[j, i] + tstep*(b1*k1[j] + b2*k2[j] + b3*k3[j] + b4*k4[j] + b5*k5[j] + b6*k6[j] + b7*k7[j])
-                )
-            end
-
-        elseif intg == "TSIT5"
-            # Tsitouras 5(4) explicit RK (7 stages, FSAL). Step uses 6 stages.
-            k1 = [dx[j](xs[:, i]..., p_args_i..., t_at(i)) for j in 1:V]
-
-            y2 = [xs[j, i] + tstep*(0.1610000000000000*k1[j]) for j in 1:V]
-            k2 = [dx[j](y2..., p_args_i..., t_at(i, c=0.1610000000000000)) for j in 1:V]
-
-            y3 = [xs[j, i] + tstep*(-0.008480655492356989*k1[j] + 0.3354806554923570*k2[j]) for j in 1:V]
-            k3 = [dx[j](y3..., p_args_i..., t_at(i, c=0.3270000000000000)) for j in 1:V]
-
-            y4 = [xs[j, i] + tstep*(2.8971530571054935*k1[j] - 6.3594484899750750*k2[j] + 4.3622954328695815*k3[j]) for j in 1:V]
-            k4 = [dx[j](y4..., p_args_i..., t_at(i, c=0.9)) for j in 1:V]
-
-            y5 = [xs[j, i] + tstep*(5.3258648284392570*k1[j] -11.7488835640628280*k2[j] + 7.4955393428898365*k3[j] -0.09249506636175525*k4[j]) for j in 1:V]
-            k5 = [dx[j](y5..., p_args_i..., t_at(i, c=1.0)) for j in 1:V]
-
-            y6 = [xs[j, i] + tstep*(5.8614554429464200*k1[j] -12.9209693178471100*k2[j] + 8.1593678985761590*k3[j] -0.07158497328140100*k4[j] -0.02826905039406838*k5[j]) for j in 1:V]
-            k6 = [dx[j](y6..., p_args_i..., t_at(i, c=1.0)) for j in 1:V]
-
-            # Update uses a7 row (FSAL): y_{i+1} = y_i + h*sum(a7j * kj, j=1..6)
-            for j in 1:V
-                JuMP.@constraint(model,
-                    xs[j, i+1] == xs[j, i] + tstep*(0.09646076681806523*k1[j] + 0.01000000000000000*k2[j] +
-                                                    0.47988965041449960*k3[j] + 1.3790085741037420*k4[j] +
-                                                   -3.2900695154360810*k5[j] + 2.3247105240997740*k6[j])
-                )
-            end
-
         elseif intg == "IRK4"
-            # Implicit RK order 4 (2-stage Gauss–Legendre)
+            # Implicit RK order 4 (2-stage Gauss-Legendre)
             c1 = 0.5 - sqrt(3)/6
             c2 = 0.5 + sqrt(3)/6
             a11 = 1/4
@@ -350,6 +408,7 @@ function register_odesystem(model::JuMP.Model,
             b1 = 1/2
             b2 = 1/2
 
+            # In IRK4 the stage slopes are also decision variables.
             ks = JuMP.@variable(model, [1:V, 1:2])
 
             y1 = [xs[j, i] + tstep*(a11*ks[j,1] + a12*ks[j,2]) for j in 1:V]
@@ -365,183 +424,33 @@ function register_odesystem(model::JuMP.Model,
             for j in 1:V
                 JuMP.@constraint(model, xs[j, i+1] == xs[j, i] + tstep*(b1*ks[j,1] + b2*ks[j,2]))
             end
-            # === IRK4 (Gauss-Legendre 2-stage) ===
-            # c1 = 0.5 - sqrt(3)/6
-            # c2 = 0.5 + sqrt(3)/6
-            # a11 = 1/4; a12 = 1/4 - sqrt(3)/6
-            # a21 = 1/4 + sqrt(3)/6; a22 = 1/4
-            # b1  = 1/2; b2  = 1/2
-
-            # for i in 1:N
-            #     # 1) 显式建阶段状态变量，避免把大表达式直接塞进 f(·)
-            #     @variable(model, y1[1:V])
-            #     @variable(model, y2[1:V])
-
-            #     # 2) 阶段导数变量
-            #     @variable(model, ks[1:V, 1:2])
-
-            #     # 3) 链接阶段状态与 k（纯线性，求解更稳）
-            #     @constraint(model, [j=1:V], y1[j] == xs[j,i] + tstep*(a11*ks[j,1] + a12*ks[j,2]))
-            #     @constraint(model, [j=1:V], y2[j] == xs[j,i] + tstep*(a21*ks[j,1] + a22*ks[j,2]))
-
-            #     # 阶段时间用“数值”，不要把 JuMP 变量当时间传进去
-            #     t1 = t0 + (i-1 + c1)*tstep
-            #     t2 = t0 + (i-1 + c2)*tstep
-
-            #     # 4) 给 k 合理的初值（用显式Euler做个热启动）
-            #     #    k0 ≈ f(xs[:,i], t_i)
-            #     t_i = t0 + (i-1)*tstep
-            #     p_args_i = (p_disc_vars === nothing) ? () : (p_disc_vars[i]...,)
-            #     k0 = similar(xs, V)
-            #     for j in 1:V
-            #         # 若你有已经注册成 NL 的 f_j，可以用  value/计算得到数值初值；
-            #         # 没有也行，给个保守常数起步
-            #         k0[j] = 0.0
-            #     end
-            #     set_start_value.(ks[:,1], k0)
-            #     set_start_value.(ks[:,2], k0)
-            #     set_start_value.(y1, value.(xs[:,i]))
-            #     set_start_value.(y2, value.(xs[:,i]))
-
-            #     # 5) 阶段隐式方程（建议用 @NLconstraint；若你已把 dx[j] 注册成 JuMP 函数，就替换成它）
-            #     @NLconstraint(model, [j=1:V],
-            #         ks[j,1] == dx_j(j, y1..., p_args_i..., t1) )
-            #     @NLconstraint(model, [j=1:V],
-            #         ks[j,2] == dx_j(j, y2..., p_args_i..., t2) )
-
-            #     # 6) 主更新
-            #     @constraint(model, [j=1:V],
-            #         xs[j, i+1] == xs[j,i] + tstep*(b1*ks[j,1] + b2*ks[j,2]) )
-            # end
-        elseif intg == "RADAU" || intg == "RADAU5" || intg == "RADAUIIA"
-            # 3-stage Radau IIA (order 5) implicit RK
-            s6 = sqrt(6.0)
-            # Nodes (not explicitly used here)
-            _c1 = (4 - s6)/10
-            _c2 = (4 + s6)/10
-            _c3 = 1.0
-            # A matrix
-            a11 = 11/45 - 7*s6/360
-            a12 = 37/225 - 169*s6/1800
-            a13 = -2/225 + s6/75
-
-            a21 = 37/225 + 169*s6/1800
-            a22 = 11/45 + 7*s6/360
-            a23 = -2/225 - s6/75
-
-            a31 = 4/9 - s6/36
-            a32 = 4/9 + s6/36
-            a33 = 1/9
-            # b vector
-            b1 = a31
-            b2 = a32
-            b3 = a33
-
-            ks = JuMP.@variable(model, [1:V, 1:3])
-
-            y1 = [xs[j, i] + tstep*(a11*ks[j,1] + a12*ks[j,2] + a13*ks[j,3]) for j in 1:V]
-            for j in 1:V
-                JuMP.@constraint(model, ks[j,1] == dx[j](y1..., p_args_i..., t_at(i, c=_c1)))
-            end
-
-            y2 = [xs[j, i] + tstep*(a21*ks[j,1] + a22*ks[j,2] + a23*ks[j,3]) for j in 1:V]
-            for j in 1:V
-                JuMP.@constraint(model, ks[j,2] == dx[j](y2..., p_args_i..., t_at(i, c=_c2)))
-            end
-
-            y3 = [xs[j, i] + tstep*(a31*ks[j,1] + a32*ks[j,2] + a33*ks[j,3]) for j in 1:V]
-            for j in 1:V
-                JuMP.@constraint(model, ks[j,3] == dx[j](y3..., p_args_i..., t_at(i, c=_c3)))
-            end
-
-            for j in 1:V
-                JuMP.@constraint(model, xs[j, i+1] == xs[j, i] + tstep*(b1*ks[j,1] + b2*ks[j,2] + b3*ks[j,3]))
-            end
-
-        elseif intg == "TRBDF2"
-            # 2-stage SDIRK approximation (L-stable, order 2)
-            γ = 2 - sqrt(2)  # ~0.585786
-            a11 = γ
-            a21 = 1 - γ
-            a22 = γ
-            b1 = 1 - γ
-            b2 = γ
-
-            ks = JuMP.@variable(model, [1:V, 1:2])
-
-            y1 = [xs[j, i] + tstep*(a11*ks[j,1]) for j in 1:V]
-            for j in 1:V
-                JuMP.@constraint(model, ks[j,1] == dx[j](y1..., p_args_i..., t_at(i, c=γ)))
-            end
-
-            y2 = [xs[j, i] + tstep*(a21*ks[j,1] + a22*ks[j,2]) for j in 1:V]
-            for j in 1:V
-                JuMP.@constraint(model, ks[j,2] == dx[j](y2..., p_args_i..., t_at(i, c=1.0)))
-            end
-
-            for j in 1:V
-                JuMP.@constraint(model, xs[j, i+1] == xs[j, i] + tstep*(b1*ks[j,1] + b2*ks[j,2]))
-            end
-
-        elseif intg == "BDF" || intg == "BDF2"
-            if i == 1
-                for j in 1:V
-                    JuMP.@constraint(model, xs[j, i+1] == xs[j, i] + tstep * dx[j](xs[:, i+1]..., p_args_i..., t_at(i, c=1.0)))
-                end
-            else
-                for j in 1:V
-                    JuMP.@constraint(model,
-                        xs[j, i+1] == (4/3) * xs[j, i] - (1/3) * xs[j, i-1] + (2/3) * tstep * dx[j](xs[:, i+1]..., p_args_i..., t_at(i, c=1.0)))
-                end
-            end
-
-        elseif intg == "ROS2" || intg == "ROS" || intg == "ROSENBROCK"
-            # Rosenbrock–W method (order 2, 2 stages), Jacobian frozen at x_i
-            @assert Jfun !== nothing "Jacobian function not built"
-            Ji = Jfun(xs[:, i]..., p_args_i..., t_at(i, c=0.0))  # V×V matrix (expressions)
-
-            γ = 1 - 1/sqrt(2)
-            a21 = 1.0
-            c21 = -2.0  # W-method (Hairer/Wanner), J frozen at x_i
-            m1 = 0.5
-            m2 = 0.5
-
-            ks = JuMP.@variable(model, [1:V, 1:2])
-
-            # Stage 1: (I - γ h J) k1 = h f(x_i)
-            f1 = [dx[j](xs[:, i]..., p_args_i..., t_at(i, c=0.0)) for j in 1:V]
-            for j in 1:V
-                JuMP.@constraint(model,
-                    ks[j,1] - γ*tstep*sum(Ji[j,m] * ks[m,1] for m in 1:V) == tstep * f1[j]
-                )
-            end
-
-            # Stage 2: (I - γ h J) k2 = h f(x_i + a21*k1) + h J (c21*k1)
-            y2 = [xs[j, i] + a21*ks[j,1] for j in 1:V]
-            f2 = [dx[j](y2..., p_args_i..., t_at(i, c=1.0)) for j in 1:V]
-            for j in 1:V
-                JuMP.@constraint(model,
-                    ks[j,2] - γ*tstep*sum(Ji[j,m] * ks[m,2] for m in 1:V) ==
-                        tstep * f2[j] + tstep * sum(Ji[j,m] * (c21*ks[m,1]) for m in 1:V)
-                )
-            end
-
-            # Update
-            for j in 1:V
-                JuMP.@constraint(model, xs[j, i+1] == xs[j, i] + m1*ks[j,1] + m2*ks[j,2])
-            end
         else
-            error("Available integrators: EE, IE, RK4, IRK4 (Gauss–Legendre 2-stage), RADAU (Radau IIA 3-stage), BDF (BDF2 with IE startup), RK5 (Dormand–Prince), TSIT5 (Tsitouras 5), TRBDF2 (SDIRK2), ROS2/ROS/ROSENBROCK (Rosenbrock–W order 2)")
+            error("Available integrators: EE, IE, RK4, IRK4 (Gauss-Legendre 2-stage)")
         end
     end
 end
 
 """
     full_solutions(model, sys)
+    full_solutions(model, sys, ps)
 
-Returns a dictionary of optimal solution values for the observed variables for a ModelingToolkit algebraic model.
+Read solved JuMP values back into MTK symbols.
+
+This is a reporting helper. It substitutes solved values into the MTK model and
+returns the observed MTK expressions.
+
+How it connects to other functions:
+- `decision_vars(...)` determines the symbol ordering used here;
+- it is useful after `register_nlsystem(...)`, `register_odesystem(...)`, or
+  `register_daesystem(...)`;
+- it lets case-study scripts stay close to the original MTK notation.
 """
-function full_solutions(model::JuMP.Model, sys::ModelingToolkit.System; ps::Vector{Num}=Num[])
+function full_solutions(model::JuMP.Model, sys::ModelingToolkit.System)
+    return full_solutions(model, sys, Num[])
+end
+
+function full_solutions(model::JuMP.Model, sys::ModelingToolkit.System, ps::Vector{Num})
+    # Rebuild the same symbol order used during registration.
     vars = decision_vars(sys, ps)
     sub_dict = ModelingToolkit.defaults(sys)
     for i in eachindex(vars)
@@ -553,6 +462,7 @@ function full_solutions(model::JuMP.Model, sys::ModelingToolkit.System; ps::Vect
     soln_dict = Dict()
     for i in eachindex(ModelingToolkit.observed(sys))
         rhsExpr = ModelingToolkit.observed(sys)[i].rhs
+        # Keep substituting until the observed expression is fully reduced.
         while !isempty(intersect(Symbolics.get_variables(rhsExpr), keys(sub_dict)))
             rhsExpr = SymbolicUtils.substitute(rhsExpr, sub_dict)
         end
@@ -564,18 +474,43 @@ end
 """
     register_daesystem(model, sys, tspan, tstep, integrator; ...)
 
-Register an index-1 DAE from ModelingToolkit into JuMP via direct transcription.
+Register a ModelingToolkit DAE system as JuMP constraints over time.
 
-Assumes equations are of the form:
-  D(x) ~ f(...)
-  0    ~ g(...)   or   z ~ h(...)
+Compared with `register_odesystem(...)`, this function also keeps the algebraic
+equations in the model.
+
+Assumed equation forms:
+- `D(x) ~ f(...)`
+- `0 ~ g(...)`
+- `z ~ h(...)` (converted internally to a residual equation)
 
 Supported integrators for the differential part:
-  - "EE"    : Explicit Euler (usually not recommended for stiff ADM1)
-  - "IE"    : Implicit Euler (recommended first for ADM1 proof-of-concept)
-  - "BDF2"  : BDF2 with IE startup (often better for stiff systems)
+- `"EE"`: Explicit Euler
+- `"IE"`: Implicit Euler
+- `"RK4"`: Classical explicit Runge-Kutta order 4
+- `"IRK4"`: two-stage Gauss-Legendre implicit Runge-Kutta order 4
 
-Algebraic equations are enforced as equality constraints at time nodes.
+How it connects to other functions:
+- `decision_vars(...; build_state_trajs=true)` provides the state trajectories
+  consumed here;
+- `_register_tracking_system!(...)` in `trackingmpc.jl` chooses this function
+  when the user sets `system_kind=:dae`;
+- use this for models like ASM2d where the algebraic equations must stay in the
+  prediction model.
+
+Algorithm:
+1. Build the time grid and normalize all user-supplied names.
+2. Split the MTK equations into two groups:
+   differential equations for stepped states, and algebraic residual equations
+   that must stay equal to zero.
+3. Build callable functions for the differential right-hand sides and algebraic
+   residuals.
+4. Read or infer the JuMP state trajectories `x_vars`.
+5. At each time step, add the chosen time-stepping equations for the
+   differential states.
+6. Also enforce the algebraic residuals, either at the nodes only or at the
+   internal RK stages when the method needs them.
+7. Keep both parts in the model so the prediction stays on the DAE manifold.
 """
 function register_daesystem(model::JuMP.Model,
                             sys::ModelingToolkit.System,
@@ -583,28 +518,32 @@ function register_daesystem(model::JuMP.Model,
                             tstep::Real,
                             integrator::String;
                             p_disc::Vector{Num}=Num[],
-                            p_disc_vars::Dict{Num,Vector{JuMP.VariableRef}}=Dict(),
-                            x_vars::Dict{Num,Vector{JuMP.VariableRef}}=Dict(),
-                            t_map::Dict{SymbolicUtils.BasicSymbolic{Real},JuMP.VariableRef}=Dict(),
+                            p_disc_vars::Dict{Num,Vector{JuMP.VariableRef}}=Dict{Num,Vector{JuMP.VariableRef}}(),
+                            x_vars::AbstractDict=Dict(),
+                            t_map::Dict{SymbolicUtils.BasicSymbolic{Real},JuMP.VariableRef}=Dict{SymbolicUtils.BasicSymbolic{Real},JuMP.VariableRef}(),
                             enforce_alg_at_t1::Bool=true)
 
     # -----------------------------
     # Time grid and dimensions
     # -----------------------------
     N = Int(floor((tspan[2] - tspan[1]) / tstep)) + 1
+    # Normalize all user input names once at the start.
+    p_disc = canonicalize_system_symbols(sys, p_disc; pool=:parameters)
+    p_disc_vars = _canonical_parameter_var_dict(sys, p_disc_vars)
+    x_vars = _canonical_state_var_dict(sys, x_vars)
     unknowns = ModelingToolkit.unknowns(sys)
     V = length(unknowns)
 
     intg = uppercase(integrator)
-    @assert intg in ("EE","IE","BDF2","BDF") "register_daesystem: integrator must be one of EE, IE, BDF2/BDF"
+    @assert intg in ("EE", "IE", "RK4", "IRK4") "register_daesystem: integrator must be one of EE, IE, RK4, IRK4"
 
-    # If user didn't pass a time variable mapping, treat time as numeric.
+    # If no time variable is passed in, use numeric time.
     t_MTK = ModelingToolkit.get_iv(sys)
     t_base = haskey(t_map, t_MTK) ? t_map[t_MTK] : tspan[1]
     t_at(i::Int; c::Real=0.0) = t_base + (i-1 + c) * tstep
 
     # -----------------------------
-    # Substitute default params (except unknowns & discretized params)
+    # Substitute default parameters, except states and discretized parameters.
     # -----------------------------
     param_dict = copy(ModelingToolkit.defaults(sys))
     for u in unknowns
@@ -622,15 +561,15 @@ function register_daesystem(model::JuMP.Model,
     end
 
     # -----------------------------
-    # Classify equations: differential vs algebraic
+    # Split equations into differential and algebraic parts.
     # -----------------------------
     idx_of = Dict(u => i for (i,u) in enumerate(unknowns))
     full_eqs = ModelingToolkit.full_equations(sys)
 
-    # differential: map var-index j -> f_j expression
+    # differential: state index -> right-hand side
     f_expr = Dict{Int,Symbolics.Num}()
 
-    # algebraic: list of residual expressions r_k(x,z,p,t) == 0
+    # algebraic: residual expressions that must equal zero
     alg_residuals = Symbolics.Num[]
 
     is_diff_lhs(lhs) = begin
@@ -649,38 +588,55 @@ function register_daesystem(model::JuMP.Model,
         rhs = eq.rhs
 
         if is_diff_lhs(lhs)
+            # Differential equation: this is stepped forward in time.
             v = diff_var(lhs)
             @assert haskey(idx_of, v) "DAE parse: differential var $v not in unknowns(sys)"
             j = idx_of[v]
             f_expr[j] = sub_defaults(rhs)
         else
-            # algebraic residual: lhs - rhs == 0
+            # Algebraic equation: turn it into a residual equal to zero.
             push!(alg_residuals, sub_defaults(lhs - rhs))
         end
     end
 
     diff_idx = sort(collect(keys(f_expr)))
+    diff_set = Set(diff_idx)
+    alg_idx = [j for j in 1:V if !(j in diff_set)]
     @assert !isempty(diff_idx) "register_daesystem: no differential equations detected"
-    # It's OK if alg_residuals is empty => system was actually ODE after simplification.
+    # It is okay if no algebraic residuals remain after simplification.
+
+    make_stage_state(diff_vals::AbstractVector, alg_vals::AbstractVector) = begin
+        @assert length(diff_vals) == length(diff_idx)
+        @assert length(alg_vals) == length(alg_idx)
+        stage = Vector{Any}(undef, V)
+        for (pos, j) in enumerate(diff_idx)
+            stage[j] = diff_vals[pos]
+        end
+        for (pos, j) in enumerate(alg_idx)
+            stage[j] = alg_vals[pos]
+        end
+        stage
+    end
 
     # -----------------------------
-    # Build functions for f and g
+    # Build callable functions for the differential and algebraic parts.
     # -----------------------------
-    # Inputs are decision_vars(sys,p_disc)..., t_MTK (matches your register_odesystem style)
+    # Use the same input order as `register_odesystem(...)`.
     dv = decision_vars(sys, p_disc)
 
     f_fun = Dict{Int,Function}()
     for j in diff_idx
-        f_fun[j] = build_function(f_expr[j], dv..., t_MTK; expression=Val(false))
+        f_fun[j] = build_function(f_expr[j], dv..., t_MTK; expression=Val{false})
     end
 
     g_fun = Function[]
     for r in alg_residuals
-        push!(g_fun, build_function(r, dv..., t_MTK; expression=Val(false)))
+        # Build the algebraic residual functions once and reuse them.
+        push!(g_fun, build_function(r, dv..., t_MTK; expression=Val{false}))
     end
 
     # -----------------------------
-    # Validate discretized parameter arrays
+    # Check the discretized parameter arrays.
     # -----------------------------
     for p in p_disc
         @assert haskey(p_disc_vars, p) "Missing p_disc_vars[$p] for $p (should have length N)"
@@ -690,7 +646,7 @@ function register_daesystem(model::JuMP.Model,
     flat_pvars = reduce(vcat, values(p_disc_vars); init=JuMP.VariableRef[])
 
     # -----------------------------
-    # Build state matrix xs (V×N)
+    # Build the state matrix `xs` with size V x N.
     # -----------------------------
     xs = Array{JuMP.VariableRef}(undef, V, N)
     if !isempty(x_vars)
@@ -700,18 +656,20 @@ function register_daesystem(model::JuMP.Model,
             xs[j, :] = x_vars[u]
         end
     else
+        # Old fallback path. Passing `x_vars` is safer.
         xs = reshape(setdiff(JuMP.all_variables(model), flat_pvars), V, N)
         @warn "register_daesystem: inferring state ordering from all_variables; pass x_vars=... to avoid mismatches."
     end
 
     # -----------------------------
-    # Differential discretization (only for diff_idx)
+    # Step only the differential states.
     # -----------------------------
     for i in 1:(N-1)
         p_args_i = [p_disc_vars[p][i] for p in p_disc]
 
         if intg == "EE"
             for j in diff_idx
+                # Only differential states are advanced here.
                 JuMP.@constraint(model,
                     xs[j, i+1] == xs[j, i] + tstep * f_fun[j](xs[:, i]..., p_args_i..., t_at(i))
                 )
@@ -724,32 +682,88 @@ function register_daesystem(model::JuMP.Model,
                 )
             end
 
-        elseif intg == "BDF2" || intg == "BDF"
-            if i == 1
-                for j in diff_idx
-                    JuMP.@constraint(model,
-                        xs[j, i+1] == xs[j, i] + tstep * f_fun[j](xs[:, i+1]..., p_args_i..., t_at(i, c=1.0))
-                    )
-                end
-            else
-                for j in diff_idx
-                    JuMP.@constraint(model,
-                        xs[j, i+1] == (4/3) * xs[j, i] - (1/3) * xs[j, i-1] +
-                                     (2/3) * tstep * f_fun[j](xs[:, i+1]..., p_args_i..., t_at(i, c=1.0))
-                    )
-                end
+        elseif intg == "RK4"
+            k1 = [f_fun[j](xs[:, i]..., p_args_i..., t_at(i)) for j in diff_idx]
+
+            # Add temporary algebraic stage variables for the RK points.
+            y2_alg = isempty(alg_idx) ? Any[] : Any[@variable(model) for _ in alg_idx]
+            y2_diff = [xs[j, i] + 0.5 * tstep * k1[pos] for (pos, j) in enumerate(diff_idx)]
+            y2 = make_stage_state(y2_diff, y2_alg)
+            for gg in g_fun
+                JuMP.@constraint(model, gg(y2..., p_args_i..., t_at(i, c=0.5)) == 0)
+            end
+            k2 = [f_fun[j](y2..., p_args_i..., t_at(i, c=0.5)) for j in diff_idx]
+
+            y3_alg = isempty(alg_idx) ? Any[] : Any[@variable(model) for _ in alg_idx]
+            y3_diff = [xs[j, i] + 0.5 * tstep * k2[pos] for (pos, j) in enumerate(diff_idx)]
+            y3 = make_stage_state(y3_diff, y3_alg)
+            for gg in g_fun
+                JuMP.@constraint(model, gg(y3..., p_args_i..., t_at(i, c=0.5)) == 0)
+            end
+            k3 = [f_fun[j](y3..., p_args_i..., t_at(i, c=0.5)) for j in diff_idx]
+
+            y4_alg = isempty(alg_idx) ? Any[] : Any[@variable(model) for _ in alg_idx]
+            y4_diff = [xs[j, i] + tstep * k3[pos] for (pos, j) in enumerate(diff_idx)]
+            y4 = make_stage_state(y4_diff, y4_alg)
+            for gg in g_fun
+                JuMP.@constraint(model, gg(y4..., p_args_i..., t_at(i, c=1.0)) == 0)
+            end
+            k4 = [f_fun[j](y4..., p_args_i..., t_at(i, c=1.0)) for j in diff_idx]
+
+            for (pos, j) in enumerate(diff_idx)
+                JuMP.@constraint(model,
+                    xs[j, i+1] == xs[j, i] + (tstep / 6.0) * (k1[pos] + 2 * k2[pos] + 2 * k3[pos] + k4[pos])
+                )
+            end
+
+        elseif intg == "IRK4"
+            c1 = 0.5 - sqrt(3) / 6
+            c2 = 0.5 + sqrt(3) / 6
+            a11 = 1 / 4
+            a12 = 1 / 4 - sqrt(3) / 6
+            a21 = 1 / 4 + sqrt(3) / 6
+            a22 = 1 / 4
+            b1 = 1 / 2
+            b2 = 1 / 2
+
+            # The implicit stage slopes and algebraic stage variables are solved
+            # together.
+            ks = JuMP.@variable(model, [1:length(diff_idx), 1:2])
+            y1_alg = isempty(alg_idx) ? Any[] : Any[@variable(model) for _ in alg_idx]
+            y2_alg = isempty(alg_idx) ? Any[] : Any[@variable(model) for _ in alg_idx]
+
+            y1_diff = [xs[j, i] + tstep * (a11 * ks[pos, 1] + a12 * ks[pos, 2]) for (pos, j) in enumerate(diff_idx)]
+            y2_diff = [xs[j, i] + tstep * (a21 * ks[pos, 1] + a22 * ks[pos, 2]) for (pos, j) in enumerate(diff_idx)]
+            y1 = make_stage_state(y1_diff, y1_alg)
+            y2 = make_stage_state(y2_diff, y2_alg)
+
+            for (pos, j) in enumerate(diff_idx)
+                JuMP.@constraint(model, ks[pos, 1] == f_fun[j](y1..., p_args_i..., t_at(i, c=c1)))
+                JuMP.@constraint(model, ks[pos, 2] == f_fun[j](y2..., p_args_i..., t_at(i, c=c2)))
+            end
+
+            for gg in g_fun
+                JuMP.@constraint(model, gg(y1..., p_args_i..., t_at(i, c=c1)) == 0)
+                JuMP.@constraint(model, gg(y2..., p_args_i..., t_at(i, c=c2)) == 0)
+            end
+
+            for (pos, j) in enumerate(diff_idx)
+                JuMP.@constraint(model,
+                    xs[j, i+1] == xs[j, i] + tstep * (b1 * ks[pos, 1] + b2 * ks[pos, 2])
+                )
             end
         end
     end
 
     # -----------------------------
-    # Algebraic constraints at nodes
+    # Enforce the algebraic equations at the time nodes.
     # -----------------------------
     if !isempty(g_fun)
         k_start = enforce_alg_at_t1 ? 1 : 2
         for k in k_start:N
             p_args_k = [p_disc_vars[p][k] for p in p_disc]
             for gg in g_fun
+                # These constraints keep the prediction on the algebraic manifold.
                 JuMP.@constraint(model, gg(xs[:, k]..., p_args_k..., t_at(k)) == 0)
             end
         end

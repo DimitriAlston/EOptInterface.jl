@@ -14,6 +14,7 @@ makedocs(;
     ),
     pages=[
         "Home" => "index.md",
+        "MPC Module" => "mpc_module.md",
     ],
 )
 
