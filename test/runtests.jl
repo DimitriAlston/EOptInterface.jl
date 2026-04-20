@@ -280,6 +280,30 @@ end
         @test logctx.Controlhist[u_key] == [0.9]
     end
 
+    @testset "indexed MTK state helpers" begin
+        ModelingToolkit.@parameters u_idx = 0.0
+        ModelingToolkit.@variables x_idx(t)[1:2]
+        @named idx_sys = ODESystem(
+            [
+                D(x_idx[1]) ~ -x_idx[1] + u_idx,
+                D(x_idx[2]) ~ x_idx[1] - x_idx[2],
+            ],
+            t,
+            collect(x_idx),
+            [u_idx],
+        )
+
+        path_syms, state_sym = EOptInterface.split_mtk_state_path(idx_sys.x_idx[2])
+        @test state_sym == :x_idx_2
+        @test last(path_syms) == :idx_sys
+
+        model = Model()
+        x_vars_idx, c_ic_idx = EOptInterface.build_state_trajs_from_vars!(model, idx_sys, [idx_sys.x_idx[2]], 4)
+        @test haskey(x_vars_idx, idx_sys.x_idx[2])
+        @test haskey(c_ic_idx, idx_sys.x_idx[2])
+        @test length(x_vars_idx[idx_sys.x_idx[2]]) == 4
+    end
+
     @testset "legacy registration compatibility" begin
         @testset "legacy ode_model no-keyword registration" begin
             @mtkmodel KineticParameterEstimation begin

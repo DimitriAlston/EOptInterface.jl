@@ -99,12 +99,19 @@ Split a ModelingToolkit-style state name such as `reactor1₊S_O(t)` into:
 Top-level states such as `x(t)` return `(Symbol[], :x)`.
 """
 function split_mtk_state_path(var)
-    text = replace(string(var), r"\(t\)" => "")
+    text = string(var)
+    indexed_match = match(r"^\((.*)\)\[(\d+)\]$", text)
+    index_suffix = ""
+    if indexed_match !== nothing
+        text = indexed_match.captures[1]
+        index_suffix = "_" * indexed_match.captures[2]
+    end
+    text = replace(text, r"\(t\)" => "")
     parts = split(text, '₊')
     if length(parts) < 2
-        return Symbol[], Symbol(text)
+        return Symbol[], Symbol(text * index_suffix)
     end
-    return Symbol.(parts[1:end-1]), Symbol(parts[end])
+    return Symbol.(parts[1:end-1]), Symbol(parts[end] * index_suffix)
 end
 
 """
@@ -355,7 +362,11 @@ subsystems.
 """
 function _resolve_path(sys, path_syms::Vector{Symbol})
     obj = sys
-    for name in path_syms
+    start_idx = 1
+    if !isempty(path_syms) && hasfield(typeof(sys), :name) && string(path_syms[1]) == string(getfield(sys, :name))
+        start_idx = 2
+    end
+    for name in path_syms[start_idx:end]
         obj = getproperty(obj, name)
     end
     return obj
@@ -489,7 +500,7 @@ function build_state_trajs_from_vars!(model::JuMP.Model,
     for (path_key, (subsys, state_syms)) in grouped
         for state_sym in sort!(collect(state_syms); by=string)
             name_source = original_var_lookup[(path_key, state_sym)]
-            var_key = path_key == "__root__" ? original_var_lookup[(path_key, state_sym)] : getproperty(subsys, state_sym)
+            var_key = name_source isa Union{AbstractString, Symbol} ? getproperty(subsys, state_sym) : name_source
             lb_var = _bound_for_var(lb, var_key, 0.0)
             ub_var = _bound_for_var(ub, var_key, 1e6)
             rhs0_var = _bound_for_var(rhs0, var_key, 0.0)

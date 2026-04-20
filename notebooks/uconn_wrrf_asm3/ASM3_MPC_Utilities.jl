@@ -11,16 +11,21 @@ Base.@kwdef struct MPCConfig
     PH::Int = 20
     CH::Int = 10
     Δt::Float64 = 0.2
+
     sp::Float64 = 3.0
     ρ::Float64 = 4e3
     Rsm::Float64 = 5.0
     R1::Float64 = 10.0
     wN::Float64 = 2.0
+
+    w_energy::Float64 = 0.0
     α::Float64 = 0.03
     V::Float64 = 1000.0
-    KLa_horizon_max::Float64 = 4000.0
-    KLa_step_max::Float64 = 400.0
+
+    KLa_min::Float64 = 0.0
+    KLa_max::Float64 = 400.0
     ΔKLa_max::Float64 = 200.0
+
     show_status::Bool = true
     status_digits::Int = 3
     status_prefix::String = "[MPC]"
@@ -34,20 +39,22 @@ mutable struct MPCController
     model::JuMP.Model
     N::Int
     Nc::Int
-    x_vars::Dict{Any, Vector{JuMP.VariableRef}}
+    x_vars::Dict{Num, Vector{JuMP.VariableRef}}
     c_ic::Dict{Any, JuMP.ConstraintRef}
     KLa2::Vector{JuMP.VariableRef}
     KLa4::Vector{JuMP.VariableRef}
     c_d1_2::JuMP.ConstraintRef
     c_d1_4::JuMP.ConstraintRef
+    sp_param::JuMP.VariableRef
+    y_sym::Num
     term_tr
     term_soft
     term_d
     term_d1
     term_energy
-    y_sym
     last_KLa2::Union{Nothing, Vector{Float64}}
     last_KLa4::Union{Nothing, Vector{Float64}}
+    last_state_trajs::Union{Nothing, Dict{Num, Vector{Float64}}}
 end
 
 Base.@kwdef mutable struct UConnMPCLog
@@ -60,6 +67,11 @@ Base.@kwdef mutable struct UConnMPCLog
     solve_times::Vector{Float64} = Float64[]
     statuses::Vector{String} = String[]
     objectives::Vector{Float64} = Float64[]
+    track_terms::Vector{Float64} = Float64[]
+    soft_terms::Vector{Float64} = Float64[]
+    move_terms::Vector{Float64} = Float64[]
+    first_move_terms::Vector{Float64} = Float64[]
+    energy_terms::Vector{Float64} = Float64[]
 end
 
 function _rhs_from_override(override, x, rhs0)
@@ -78,47 +90,12 @@ end
 function _mk_ic!(
     model::JuMP.Model,
     v::Vector{JuMP.VariableRef},
-    x;
+    x::Num;
     override::AbstractDict = Dict(),
     rhs0::Float64 = 0.0,
 )
     rhs = _rhs_from_override(override, x, rhs0)
     return get_ic_constraint!(model, v; idx = 1, rhs_if_missing = rhs)
-end
-
-function _var_bounds(x, x0::Real)
-    name = string(x)
-    mag = max(abs(float(x0)), 1.0)
-    if occursin("flow_rate", name)
-        return (0.0, max(20.0, 5.0 * mag))
-    elseif occursin("T(t)", name)
-        return (0.0, max(20.0, mag + 5.0))
-    else
-        return (0.0, max(20.0, 10.0 * mag))
-    end
-end
-
-_base_name_for(x) = replace(string(x), r"[^A-Za-z0-9]+" => "_")
-
-function _shift_start_values!(vars::Vector{JuMP.VariableRef}, prev::Union{Nothing, Vector{Float64}}, fallback::Float64)
-    if prev === nothing || isempty(prev)
-        for v in vars
-            JuMP.set_start_value(v, fallback)
-        end
-        return nothing
-    end
-    n = length(vars)
-    m = min(length(prev), n)
-    if m >= 2
-        for k in 1:(m - 1)
-            JuMP.set_start_value(vars[k], prev[k + 1])
-        end
-    end
-    JuMP.set_start_value(vars[m], prev[m])
-    for k in (m + 1):n
-        JuMP.set_start_value(vars[k], prev[end])
-    end
-    return nothing
 end
 
 function _fmt_uconn_scalar(x; digits::Int = 3)
@@ -170,46 +147,78 @@ function build_controller(sys, sol; cfg::MPCConfig = MPCConfig(), y_sym = sys.re
     PH, CH, Δt = cfg.PH, cfg.CH, cfg.Δt
     N = PH + 1
     Nc = CH + 1
-    tspan_pred = (0.0, PH * Δt)
 
     decision_vars(sys, [sys.reactor2.KLa, sys.reactor4.KLa])
 
     model = Model(Ipopt.Optimizer)
+    set_optimizer_attribute(model, "tol", 1e-6)
+    set_optimizer_attribute(model, "max_cpu_time", 300.0)
+    set_optimizer_attribute(model, "print_level", 0)
     cfg.verbose || set_silent(model)
 
-    x_vars = Dict{Any, Vector{JuMP.VariableRef}}()
+    reactor_syms = (:reactor1, :reactor2, :reactor3, :reactor4, :reactor5)
+    x_lb = fill(0.0, 13)
+    x_ub = [20.0; fill(1.0e6, 12)...]
+    x_vars = Dict{Num, Vector{JuMP.VariableRef}}()
     c_ic = Dict{Any, JuMP.ConstraintRef}()
 
     u0_full = Dict(unknowns(sys) .=> sol[1])
     u0_key_by_str = Dict(string(k) => k for k in keys(u0_full))
-
     diffvars = Any[]
     for eq in ModelingToolkit.diff_equations(sys)
         var, _ = ModelingToolkit.var_from_nested_derivative(eq.lhs)
         k = get(u0_key_by_str, string(var), nothing)
         k === nothing || push!(diffvars, k)
     end
-    diffvar_set = Set(unique(diffvars))
+    u0_dict = Dict(k => u0_full[k] for k in unique(diffvars))
+    isempty(u0_dict) && (u0_dict = u0_full)
 
-    for x in unknowns(sys)
-        x0 = get(u0_full, x, 0.0)
-        lb, ub = _var_bounds(x, x0)
-        xv = @variable(model, [1:N], lower_bound = lb, upper_bound = ub, base_name = _base_name_for(x))
-        x_vars[x] = xv
-        if x in diffvar_set
-            c_ic[x] = _mk_ic!(model, xv, x; override = u0_full, rhs0 = float(x0))
+    for rname in reactor_syms
+        r = getproperty(sys, rname)
+        for i in 1:13
+            traj = @variable(
+                model,
+                [1:N],
+                lower_bound = x_lb[i],
+                upper_bound = x_ub[i],
+                base_name = "$(rname)_x$(i)",
+            )
+            x_vars[r.x[i]] = traj
+            c_ic[r.x[i]] = _mk_ic!(model, traj, r.x[i]; override = u0_dict, rhs0 = 0.0)
         end
     end
 
-    @variable(model, 0.0 <= KLa2[1:N] <= cfg.KLa_horizon_max, base_name = "KLa2")
-    @variable(model, 0.0 <= KLa4[1:N] <= cfg.KLa_horizon_max, base_name = "KLa4")
+    # The local refined ASM3 MPC only carries the five reactor states plus the
+    # minimal algebraic flow trajectories that survive structural simplification
+    # in the UConn flowsheet. Keeping this scope small is what avoids the
+    # time-limit behavior seen with the broader unknown-state registration path.
+    aux_flow_rhs = Dict(
+        sys.splitter1.In.flow_rate => Ini2vecflow,
+        sys.mixer1.Out1.flow_rate => 1.5 * Ini2vecflow,
+        sys.mixer3.Out1.flow_rate => 1.75 * Ini2vecflow,
+        sys.clarifier.inlet_stream.flow_rate => Ini2vecflow,
+    )
+    for (var_mtk, rhs0) in aux_flow_rhs
+        haskey(u0_key_by_str, string(var_mtk)) || continue
+        traj = @variable(
+            model,
+            [1:N],
+            lower_bound = 0.0,
+            upper_bound = 1.0e6,
+            base_name = sanitize_mpc_name(var_mtk),
+        )
+        x_vars[var_mtk] = traj
+        c_ic[var_mtk] = _mk_ic!(model, traj, var_mtk; override = u0_full, rhs0 = float(rhs0))
+    end
+
+    @variable(model, cfg.KLa_min <= KLa2[1:N] <= cfg.KLa_max, base_name = "KLa2")
+    @variable(model, cfg.KLa_min <= KLa4[1:N] <= cfg.KLa_max, base_name = "KLa4")
 
     p_disc = [sys.reactor2.KLa, sys.reactor4.KLa]
     p_disc_vars = Dict(sys.reactor2.KLa => KLa2, sys.reactor4.KLa => KLa4)
 
     iv_JuMP = @variable(model, 0 <= t_stage <= 150)
-    JuMP.fix(t_stage, tspan_pred[1]; force = true)
-
+    JuMP.fix(t_stage, 0.0; force = true)
     iv_MTK = ModelingToolkit.get_iv(sys)
     iv_map = Dict(iv_MTK => iv_JuMP)
 
@@ -245,19 +254,32 @@ function build_controller(sys, sol; cfg::MPCConfig = MPCConfig(), y_sym = sys.re
     @constraint(model, [k = 2:N], ΔKLa4[k] == KLa4[k] - KLa4[k - 1])
     @constraint(model, [k = 2:N], -cfg.ΔKLa_max <= ΔKLa4[k] <= cfg.ΔKLa_max)
 
+    @variable(model, sp_param)
+    JuMP.fix(sp_param, cfg.sp; force = true)
+
     @variable(model, s_up[1:N] >= 0)
     @variable(model, s_dn[1:N] >= 0)
 
-    @constraint(model, [k = 1:N], x_vars[y_sym][k] <= cfg.sp + s_up[k])
-    @constraint(model, [k = 1:N], x_vars[y_sym][k] >= cfg.sp - s_dn[k])
+    @constraint(model, [k = 1:N], x_vars[y_sym][k] <= sp_param + s_up[k])
+    @constraint(model, [k = 1:N], x_vars[y_sym][k] >= sp_param - s_dn[k])
 
-    term_energy = @expression(model, cfg.α * cfg.V * sum(KLa2[k] + KLa4[k] for k = 1:N))
-    term_tr = @expression(model, sum((x_vars[y_sym][k] - cfg.sp)^2 for k = 1:N) + cfg.wN * (x_vars[y_sym][N] - cfg.sp)^2)
+    term_tr = @expression(
+        model,
+        sum((x_vars[y_sym][k] - sp_param)^2 for k = 1:N) +
+        cfg.wN * (x_vars[y_sym][N] - sp_param)^2,
+    )
     term_soft = @expression(model, cfg.ρ * (sum(s_up) + sum(s_dn)))
-    term_d = @expression(model, cfg.Rsm * sum(ΔKLa2[k]^2 for k = 2:N) + cfg.Rsm * sum(ΔKLa4[k]^2 for k = 2:N))
-    term_d1 = @expression(model, cfg.R1 * d1_2^2 + cfg.R1 * d1_4^2)
+    term_d = @expression(
+        model,
+        cfg.Rsm * (sum(ΔKLa2[k]^2 for k = 2:N) + sum(ΔKLa4[k]^2 for k = 2:N)),
+    )
+    term_d1 = @expression(model, cfg.R1 * (d1_2^2 + d1_4^2))
+    term_energy = @expression(
+        model,
+        (24 * cfg.Δt) * cfg.α * cfg.V * sum(KLa2[k] + KLa4[k] for k = 1:N),
+    )
 
-    @objective(model, Min, term_tr + term_soft + term_d + term_d1)
+    @objective(model, Min, term_tr + term_soft + term_d + term_d1 + cfg.w_energy * term_energy)
 
     return MPCController(
         cfg,
@@ -271,94 +293,151 @@ function build_controller(sys, sol; cfg::MPCConfig = MPCConfig(), y_sym = sys.re
         KLa4,
         c_d1_2,
         c_d1_4,
+        sp_param,
+        y_sym,
         term_tr,
         term_soft,
         term_d,
         term_d1,
         term_energy,
-        y_sym,
         nothing,
         nothing,
-    ), u0_full
+        nothing,
+    ), u0_dict
 end
 
-function _mpc_affect!(integ, ctrl::MPCController, i_state::AbstractDict, logctx::UConnMPCLog)
-    for (var, cref) in ctrl.c_ic
-        idx = get(i_state, var, nothing)
-        idx === nothing && continue
-        JuMP.set_normalized_rhs(cref, float(integ.u[idx]))
+function warm_start_trajectories!(ctrl::MPCController)
+    if ctrl.last_state_trajs !== nothing
+        for (var, traj) in ctrl.x_vars
+            old = get(ctrl.last_state_trajs, var, nothing)
+            old === nothing && continue
+            for k in 1:(ctrl.N - 1)
+                JuMP.set_start_value(traj[k], old[k + 1])
+            end
+            JuMP.set_start_value(traj[ctrl.N], old[end])
+        end
     end
 
-    K2_prev = float(integ.ps[ctrl.sys.reactor2.KLa])
-    K4_prev = float(integ.ps[ctrl.sys.reactor4.KLa])
+    if ctrl.last_KLa2 === nothing || ctrl.last_KLa4 === nothing
+        return nothing
+    end
+    for k in 1:(ctrl.N - 1)
+        JuMP.set_start_value(ctrl.KLa2[k], ctrl.last_KLa2[k + 1])
+        JuMP.set_start_value(ctrl.KLa4[k], ctrl.last_KLa4[k + 1])
+    end
+    JuMP.set_start_value(ctrl.KLa2[ctrl.N], ctrl.last_KLa2[end])
+    JuMP.set_start_value(ctrl.KLa4[ctrl.N], ctrl.last_KLa4[end])
+    return nothing
+end
+
+function setpoint!(ctrl::MPCController, sp_new::Real)
+    JuMP.fix(ctrl.sp_param, float(sp_new); force = true)
+    return nothing
+end
+
+function make_logctx(sys)
+    unk = unknowns(sys)
+    return UConnMPCLog(i_state = Dict(var => i for (i, var) in pairs(unk)))
+end
+
+function _log_current_state!(logctx::UConnMPCLog, ctrl::MPCController, integ)
+    y_idx = logctx.i_state[ctrl.y_sym]
+    push!(logctx.ts, float(integ.t))
+    push!(logctx.setpoints, float(JuMP.fix_value(ctrl.sp_param)))
+    push!(logctx.SNH4, float(integ.u[y_idx]))
+    push!(logctx.KLa2, float(integ.ps[ctrl.sys.reactor2.KLa]))
+    push!(logctx.KLa4, float(integ.ps[ctrl.sys.reactor4.KLa]))
+    return nothing
+end
+
+function mpc_solve_step!(ctrl::MPCController, integ, logctx::Union{Nothing, UConnMPCLog}=nothing)
+    cfg = ctrl.cfg
+    sys = ctrl.sys
+    i_state = logctx === nothing ? Dict(var => i for (i, var) in pairs(unknowns(sys))) : logctx.i_state
+
+    for (var, cref) in ctrl.c_ic
+        JuMP.set_normalized_rhs(cref, float(integ.u[i_state[var]]))
+    end
+
+    K2_prev = float(integ.ps[sys.reactor2.KLa])
+    K4_prev = float(integ.ps[sys.reactor4.KLa])
     JuMP.set_normalized_rhs(ctrl.c_d1_2, K2_prev)
     JuMP.set_normalized_rhs(ctrl.c_d1_4, K4_prev)
 
-    JuMP.set_lower_bound(ctrl.KLa2[1], max(0.0, K2_prev - ctrl.cfg.ΔKLa_max))
-    JuMP.set_upper_bound(ctrl.KLa2[1], min(ctrl.cfg.KLa_step_max, K2_prev + ctrl.cfg.ΔKLa_max))
-    JuMP.set_lower_bound(ctrl.KLa4[1], max(0.0, K4_prev - ctrl.cfg.ΔKLa_max))
-    JuMP.set_upper_bound(ctrl.KLa4[1], min(ctrl.cfg.KLa_step_max, K4_prev + ctrl.cfg.ΔKLa_max))
+    JuMP.set_lower_bound(ctrl.KLa2[1], max(cfg.KLa_min, K2_prev - cfg.ΔKLa_max))
+    JuMP.set_upper_bound(ctrl.KLa2[1], min(cfg.KLa_max, K2_prev + cfg.ΔKLa_max))
+    JuMP.set_lower_bound(ctrl.KLa4[1], max(cfg.KLa_min, K4_prev - cfg.ΔKLa_max))
+    JuMP.set_upper_bound(ctrl.KLa4[1], min(cfg.KLa_max, K4_prev + cfg.ΔKLa_max))
 
-    _shift_start_values!(ctrl.KLa2, ctrl.last_KLa2, K2_prev)
-    _shift_start_values!(ctrl.KLa4, ctrl.last_KLa4, K4_prev)
-
+    warm_start_trajectories!(ctrl)
     optimize!(ctrl.model)
-    status = JuMP.termination_status(ctrl.model)
-    status_io = _uconn_status_io(ctrl.cfg)
-    push!(logctx.solve_times, float(integ.t))
-    push!(logctx.statuses, string(status))
 
-    if JuMP.has_values(ctrl.model)
-        ctrl.last_KLa2 = value.(ctrl.KLa2)
-        ctrl.last_KLa4 = value.(ctrl.KLa4)
-        push!(logctx.objectives, JuMP.objective_value(ctrl.model))
+    st = JuMP.termination_status(ctrl.model)
+    accepted = is_accepted_mpc_status(st; accepted_statuses = default_mpc_accepted_statuses())
 
-        KLa2_now = value(ctrl.KLa2[1])
-        KLa4_now = value(ctrl.KLa4[1])
-        if abs(KLa2_now - K2_prev) < 1e-3
-            KLa2_now = K2_prev
-        end
-        if abs(KLa4_now - K4_prev) < 1e-3
-            KLa4_now = K4_prev
-        end
-        integ.ps[ctrl.sys.reactor2.KLa] = clamp(KLa2_now, 0.0, ctrl.cfg.KLa_step_max)
-        integ.ps[ctrl.sys.reactor4.KLa] = clamp(KLa4_now, 0.0, ctrl.cfg.KLa_step_max)
-        if ctrl.cfg.show_status
-            print_uconn_mpc_status(
-                status_io,
-                ctrl,
-                status,
-                JuMP.objective_value(ctrl.model),
-                integ.t,
-                integ.u[i_state[ctrl.y_sym]],
-                ctrl.cfg.sp,
-                integ.ps[ctrl.sys.reactor2.KLa],
-                integ.ps[ctrl.sys.reactor4.KLa],
-                digits = ctrl.cfg.status_digits,
-                prefix = ctrl.cfg.status_prefix,
-            )
-        end
+    info = if accepted && JuMP.has_values(ctrl.model)
+        K2 = float(JuMP.value(ctrl.KLa2[1]))
+        K4 = float(JuMP.value(ctrl.KLa4[1]))
+        abs(K2 - K2_prev) < 1e-3 && (K2 = K2_prev)
+        abs(K4 - K4_prev) < 1e-3 && (K4 = K4_prev)
+        integ.ps[sys.reactor2.KLa] = K2
+        integ.ps[sys.reactor4.KLa] = K4
+        ctrl.last_KLa2 = collect(float.(JuMP.value.(ctrl.KLa2)))
+        ctrl.last_KLa4 = collect(float.(JuMP.value.(ctrl.KLa4)))
+        ctrl.last_state_trajs = Dict(
+            var => collect(float.(JuMP.value.(traj))) for (var, traj) in ctrl.x_vars
+        )
+        (
+            status = st,
+            obj = float(JuMP.objective_value(ctrl.model)),
+            tr = float(JuMP.value(ctrl.term_tr)),
+            soft = float(JuMP.value(ctrl.term_soft)),
+            d = float(JuMP.value(ctrl.term_d)),
+            d1 = float(JuMP.value(ctrl.term_d1)),
+            energy = float(JuMP.value(ctrl.term_energy)),
+        )
     else
-        push!(logctx.objectives, NaN)
-        integ.ps[ctrl.sys.reactor2.KLa] = K2_prev
-        integ.ps[ctrl.sys.reactor4.KLa] = K4_prev
-        if ctrl.cfg.show_status
-            print_uconn_mpc_status(
-                status_io,
-                ctrl,
-                status,
-                NaN,
-                integ.t,
-                integ.u[i_state[ctrl.y_sym]],
-                ctrl.cfg.sp,
-                integ.ps[ctrl.sys.reactor2.KLa],
-                integ.ps[ctrl.sys.reactor4.KLa],
-                digits = ctrl.cfg.status_digits,
-                prefix = ctrl.cfg.status_prefix,
-            )
-        end
+        integ.ps[sys.reactor2.KLa] = K2_prev
+        integ.ps[sys.reactor4.KLa] = K4_prev
+        (
+            status = st,
+            obj = NaN,
+            tr = NaN,
+            soft = NaN,
+            d = NaN,
+            d1 = NaN,
+            energy = NaN,
+        )
     end
-    return nothing
+
+    if logctx !== nothing
+        push!(logctx.solve_times, float(integ.t))
+        push!(logctx.statuses, string(info.status))
+        push!(logctx.objectives, info.obj)
+        push!(logctx.track_terms, info.tr)
+        push!(logctx.soft_terms, info.soft)
+        push!(logctx.move_terms, info.d)
+        push!(logctx.first_move_terms, info.d1)
+        push!(logctx.energy_terms, info.energy)
+    end
+
+    if cfg.show_status
+        print_uconn_mpc_status(
+            _uconn_status_io(cfg),
+            ctrl,
+            info.status,
+            info.obj,
+            integ.t,
+            integ.u[i_state[ctrl.y_sym]],
+            JuMP.fix_value(ctrl.sp_param),
+            integ.ps[sys.reactor2.KLa],
+            integ.ps[sys.reactor4.KLa];
+            digits = cfg.status_digits,
+            prefix = cfg.status_prefix,
+        )
+    end
+
+    return integ.ps[sys.reactor2.KLa], integ.ps[sys.reactor4.KLa], info
 end
 
 function run_uconn_closed_loop_mpc(
@@ -370,56 +449,62 @@ function run_uconn_closed_loop_mpc(
     cfg_hi::MPCConfig = MPCConfig(sp = 3.0),
     cfg_lo::MPCConfig = MPCConfig(sp = 2.0),
 )
-    ctrl_hi, u0_full = build_controller(sys, sol; cfg = cfg_hi, y_sym = y_sym)
-    ctrl_lo, _ = build_controller(sys, sol; cfg = cfg_lo, y_sym = y_sym)
-
-    set_attribute(ctrl_hi.model, "max_cpu_time", 20.0)
-    set_attribute(ctrl_hi.model, "acceptable_tol", 1e-4)
-    set_attribute(ctrl_lo.model, "max_cpu_time", 20.0)
-    set_attribute(ctrl_lo.model, "acceptable_tol", 1e-4)
+    ctrl, u0_dict = build_controller(sys, sol; cfg = cfg_hi, y_sym = y_sym)
+    logctx = make_logctx(sys)
 
     Δt_ctrl = cfg_hi.Δt
-    times_ctrl = collect(first(simulation_span):Δt_ctrl:last(simulation_span))
-    times_ctrl2 = collect(last(simulation_span):Δt_ctrl:last(simulation_span_long))
-    savetimes = collect(first(simulation_span_long):Δt_ctrl / 10:last(simulation_span_long))
-
-    unk = unknowns(sys)
-    i_state = Dict(var => i for (i, var) in pairs(unk))
-    logctx = UConnMPCLog(i_state = i_state)
-
-    setpoint_fn(tnow) = tnow < last(simulation_span) ? cfg_hi.sp : cfg_lo.sp
+    t0, tf = simulation_span_long
+    switch_time = last(simulation_span)
+    n_ctrl = max(0, Int(floor((tf - t0) / Δt_ctrl + 1e-9)))
+    mpc_times = [t0 + k * Δt_ctrl for k in 0:(n_ctrl - 1)]
+    log_times = collect(t0:Δt_ctrl:tf)
+    tstops = sort(unique(vcat(log_times, mpc_times, [switch_time])))
 
     function _log_affect!(integ)
-        push!(logctx.ts, float(integ.t))
-        push!(logctx.setpoints, float(setpoint_fn(integ.t)))
-        push!(logctx.SNH4, float(integ.u[i_state[y_sym]]))
-        push!(logctx.KLa2, float(integ.ps[sys.reactor2.KLa]))
-        push!(logctx.KLa4, float(integ.ps[sys.reactor4.KLa]))
+        _log_current_state!(logctx, ctrl, integ)
         return nothing
     end
 
-    function _mpc_affect_hi!(integ)
-        _mpc_affect!(integ, ctrl_hi, i_state, logctx)
+    function _mpc_affect!(integ)
+        mpc_solve_step!(ctrl, integ, logctx)
+        return nothing
     end
 
-    function _mpc_affect_lo!(integ)
-        _mpc_affect!(integ, ctrl_lo, i_state, logctx)
+    function _sp_change_affect!(integ)
+        setpoint!(ctrl, cfg_lo.sp)
+        return nothing
     end
 
-    log_cb = PresetTimeCallback(savetimes, _log_affect!; save_positions = (false, false))
-    mpc_cb = PresetTimeCallback(times_ctrl, _mpc_affect_hi!; save_positions = (false, false))
-    mpc_cb2 = PresetTimeCallback(times_ctrl2, _mpc_affect_lo!; save_positions = (false, false))
-    callbacks = CallbackSet(log_cb, mpc_cb, mpc_cb2)
+    callbacks = Any[
+        PresetTimeCallback(log_times, _log_affect!; save_positions = (false, false)),
+        PresetTimeCallback(mpc_times, _mpc_affect!; save_positions = (false, false)),
+    ]
+    if switch_time > t0 && switch_time < tf
+        push!(callbacks, PresetTimeCallback([switch_time], _sp_change_affect!; save_positions = (false, false)))
+    end
 
-    prob_cl = ODEProblem(sys, u0_full, simulation_span_long; warn_initialize_determined = false)
+    cl_guesses = Dict(
+        sys.splitter1.In.flow_rate => Ini2vecflow,
+        sys.mixer1.Out1.flow_rate => 1.5 * Ini2vecflow,
+        sys.mixer3.Out1.flow_rate => 1.75 * Ini2vecflow,
+        sys.clarifier.inlet_stream.flow_rate => Ini2vecflow,
+        sys.clarifier.recycle_stream.flow_rate => 0.4 * Ini2vecflow,
+    )
+    prob_cl = ODEProblem(
+        sys,
+        u0_dict,
+        simulation_span_long;
+        guesses = cl_guesses,
+        warn_initialize_determined = false,
+    )
     sol_cl = solve(
         prob_cl,
         FBDF();
         adaptive = true,
         initializealg = OrdinaryDiffEqNonlinearSolve.BrownFullBasicInit(),
-        callback = callbacks,
-        tstops = union(savetimes, times_ctrl, times_ctrl2),
-        saveat = savetimes,
+        callback = CallbackSet(callbacks...),
+        tstops = tstops,
+        saveat = log_times,
     )
 
     log_df = DataFrame(
@@ -431,8 +516,7 @@ function run_uconn_closed_loop_mpc(
     )
 
     return (
-        ctrl_hi = ctrl_hi,
-        ctrl_lo = ctrl_lo,
+        ctrl = ctrl,
         sol = sol_cl,
         log = logctx,
         log_df = log_df,
