@@ -1,5 +1,9 @@
 # News for EOptInterface Releases
 
+## [v0.2.0](https://github.com/PSORLab/EOptInterface.jl/releases/tag/v0.2.0) (June 19, 2026)
+
+- Bumped ModelingToolkit.jl compatibility to v11.
+
 ## [v0.1.1](https://github.com/PSORLab/EOptInterface.jl/releases/tag/v0.1.1) (April 22, 2026)
 
 - Added notebook examples.
